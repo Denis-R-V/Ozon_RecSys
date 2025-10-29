@@ -1,14 +1,86 @@
+import json
+import os
+import requests
 import shutil
-import subprocess
+import zipfile
 from pathlib import Path
+from tqdm import tqdm
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+OWNER_SLUG = "thunderpede"
+DATASET_SLUG = "testststs"
 
 
-def ensure_data_dir():
-    """Создание каталога data, если не создан ранее"""
+def dataset_ok() -> bool:
+    
+    root_parquet = "ml_ozon_recsys_test.snappy.parquet"
+    expected_counts = {
+        "archive_extra_orders_data": 28,
+        "final_apparel_tracker_data_08_action_widget": 2800,
+        "ml_ozon_recsys_train_final_apparel_orders_data": 5,
+        "ml_ozon_recsys_train_final_apparel_tracker_data": 200,
+        "ml_ozon_recsys_train_final_apparel_items_data": 100,
+        "ml_ozon_recsys_train_final_categories_tree": 1,
+    }
+
+    # корневой файл parquet
+    f = DATA_DIR / root_parquet
+    if not f.is_file() or f.stat().st_size == 0:
+        return False
+
+    # структура каталогов и количество parquet
+    for name, exp in expected_counts.items():
+        d = DATA_DIR / name
+        if not d.is_dir():
+            return False
+        if len(list(d.rglob("*.parquet"))) != exp:
+            return False
+
+    return True
+
+
+def download_from_kaggle(owner_slug, dataset_slug):
+    """
+    Загрузка датасета с kaggle (библиотека kaggle падает по памяти)
+    """
+    with open(os.path.expanduser("~/.kaggle/kaggle.json")) as f:
+        key = json.load(f)["key"]
+
+    url = f"https://www.kaggle.com/api/v1/datasets/download/{owner_slug}/{dataset_slug}"
+    headers = {"Authorization": f"Bearer {key}"}
+
+    output_path = DATA_DIR / f"{dataset_slug}.zip"
+    
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    with requests.get(url, headers=headers, stream=True) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        with open(output_path, "wb") as f, tqdm(
+            total=total, unit="B", unit_scale=True, desc="Downloading"
+        ) as bar:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    bar.update(len(chunk))
+
+
+def unzip_with_progress(zip_path: str, extract_to: str):
+    zip_path = Path(zip_path)
+    extract_to = Path(extract_to)
+    extract_to.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        members = zip_ref.infolist()
+        total_files = len(members)
+
+        with tqdm(total=total_files, desc="Unzipping", unit="file") as pbar:
+            for member in members:
+                zip_ref.extract(member, extract_to)
+                pbar.update(1)
+
+    zip_path.unlink(missing_ok=True)
 
 
 def unwrap_data_dirs():
@@ -50,20 +122,14 @@ def unwrap_data_dirs():
             outer.rmdir()
 
 
-def download_dataset():
+def download_dataset(force=False):
     """Загрузка датасета с Kaggle, если он не загружен ранее"""
-    ensure_data_dir()
 
-    if any(DATA_DIR.glob("**/*.parquet")):
+    if dataset_ok():
         print("Датасет загружен ранее")
         return
-    
-    dataset = "thunderpede/testststs"
-    cmd = ["kaggle", "datasets", "download", "-d", dataset, "-p", str(DATA_DIR), "--unzip"]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    for zip_file in DATA_DIR.glob("*.zip"):
-        zip_file.unlink(missing_ok=True)
-
+    download_from_kaggle(OWNER_SLUG, DATASET_SLUG)
+    unzip_with_progress(DATA_DIR / f"{DATASET_SLUG}.zip", DATA_DIR)
     unwrap_data_dirs()
     print("Датасет загружен")
