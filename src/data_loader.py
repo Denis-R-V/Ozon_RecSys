@@ -9,7 +9,7 @@ from tqdm import tqdm
 import dask.dataframe as dd
 
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "raw"
 
 OWNER_SLUG = "thunderpede"
 DATASET_SLUG = "testststs"
