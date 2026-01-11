@@ -1,7 +1,7 @@
 import os
 import time
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Tuple
 
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
@@ -9,24 +9,30 @@ import numpy as np
 import pandas as pd
 import implicit
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, Form, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from jose import jwt, JWTError
 
 from db import SessionLocal, RequestHistory
 
-# Конфиги
-MODEL_DIR = "models"
-DEFAULT_K = 100
-CANDIDATE_MULTIPLIER = 10
-JWT_SECRET = "secret"          # На время проверки так, потом можно в файлик запихнуть
-JWT_ALGO = "HS256"
-JWT_EXPIRE_MIN = 60
-ADMIN_PASSWORD = "password"    # На время проверки так, потом можно в файлик запихнуть
+from config import (
+    # DATABASE_URL,
+    ALS_MODEL_PATH,
+    ALS_USER_MAPPING_PATH,
+    ALS_ITEM_MAPPING_PATH,
+    ALS_PURCHASED_PATH,
+    POPULAR_ITEMS_PATH,
+    DEFAULT_K,
+    CANDIDATE_MULTIPLIER,
+    JWT_SECRET,
+    JWT_ALGO,
+    JWT_EXPIRE_MIN,
+    ADMIN_PASSWORD,
+)
 
 
-app = FastAPI(title="ALS Recommendation Service")
+app = FastAPI(title="Ozon Apparel Recommendation Service")
 security = HTTPBearer()
 
 
@@ -64,30 +70,21 @@ class ForwardResponse(BaseModel):
     user_id: int
     recommendations: List[int]
 
-# Загрузка модели
-model = implicit.cpu.als.AlternatingLeastSquares.load(
-    f"{MODEL_DIR}/als_model.npz"
-)
+# Загрузка моделей
+model = implicit.cpu.als.AlternatingLeastSquares.load(ALS_MODEL_PATH)
 
-user_map = pd.read_parquet(f"{MODEL_DIR}/als_user_mapping.parquet")
+user_map = pd.read_parquet(ALS_USER_MAPPING_PATH)
 user_id_to_idx = dict(zip(user_map.user_id, user_map.user_idx))
 
-item_map = pd.read_parquet(f"{MODEL_DIR}/als_item_mapping.parquet")
+item_map = pd.read_parquet(ALS_ITEM_MAPPING_PATH)
 idx_to_item_id = dict(zip(item_map.item_idx, item_map.item_id))
 
-purchased_by_user_idx = np.load(
-    f"{MODEL_DIR}/als_purchased_by_user_idx.npy",
-    allow_pickle=True
-).item()
+purchased_by_user_idx = np.load(ALS_PURCHASED_PATH, allow_pickle=True).item()
 
-popular_items = (
-    pd.read_parquet(f"{MODEL_DIR}/popular_items.parquet")
-    .item_id.astype(int)
-    .tolist()
-)
+popular_items = (pd.read_parquet(POPULAR_ITEMS_PATH).item_id.astype(int).tolist())
 
 # Инференс
-def recommend(user_id: int, k: int):
+def recommend(user_id: int, k: int) -> Tuple[bool, List[int]]:
     if user_id not in user_id_to_idx:
         return True, popular_items[:k]
 
@@ -116,7 +113,7 @@ def recommend(user_id: int, k: int):
 
 
 @app.post("/login")
-def login(password: str):
+def login(password: str = Form(...)):
     if password != ADMIN_PASSWORD:
         raise HTTPException(403, "forbidden")
     return {"access_token": create_admin_token(), "token_type": "bearer"}

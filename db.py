@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine, Column, Integer, String, Float
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-DATABASE_URL = "sqlite:///./history.db"
+from config import DATABASE_URL
 
 engine = create_engine(
     DATABASE_URL,
