@@ -34,3 +34,56 @@
 6. Создание сервиса с имплементацией лучшего ML-решения
 7. Разработка DL-модели
 8. Доработка задачи: улучшение сервисной части по обратной связи от команды курса П.Р.; тюнинг DL-моделей и выбор лучшего решения overall
+
+## Запуск сервиса
+- должен быть установлен Python 3.10+
+- должны быть установлены зависимости из requirements.txt:
+    pip install -r requirements.txt
+- в корне проекта должна присутствовать директория models с файлами модели, маппингов, популярных товаров и товаров, купленных пользователями ([ссылка](https://disk.yandex.ru/d/dpCwLMmqQjXoJA))
+- в корне проекта должен присутствовать файл .env (скопировать содержимое .env.example и изменить JWT_SECRET и ADMIN_PASSWORD)
+- запуск сервиса:
+    - uvicorn main:app --host 0.0.0.0 --port 8000
+- для доступа к административным эндпоинтам и статистике необходимо получить JWT-токен (эндпоинт /login)
+
+### Основные эндпоинты:
+- Инференс
+    - POST /forward — получить рекомендации для пользователя
+
+- Мониторинг
+    - GET /health — liveness-проверка
+    - GET /health/ready — readiness-проверка (БД + модель)
+    - GET /stats — агрегированные метрики сервиса (admin)
+- Администрирование
+    - GET /history — история запросов
+    - DELETE /history — очистка истории
+
+### Примеры запросов: 
+- Инференс рекомендаций:
+curl -X POST \
+  'http://127.0.0.1:8000/forward' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "user_id": 3423970,
+    "k": 100
+  }'
+    - ответ: {
+  "user_id": 3423970,
+  "recommendations": [12345, 67890, 11223, ...]
+}
+
+- Получение JWT-токена (admin):
+curl -X POST \
+  'http://127.0.0.1:8000/login' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'password=password'
+    - ответ: {
+    "access_token": "<JWT_TOKEN>",
+    "token_type": "bearer"
+    }
+
+- Пример запроса с авторизацией:
+curl -X GET \
+  'http://127.0.0.1:8000/history?limit=100' \
+  -H 'Authorization: Bearer <JWT_TOKEN>'
