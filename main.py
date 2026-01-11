@@ -20,7 +20,6 @@ from sqlalchemy.orm import Session
 from config import (
     ADMIN_PASSWORD,
     ALS_ITEM_MAPPING_PATH,
-    # DATABASE_URL,
     ALS_MODEL_PATH,
     ALS_PURCHASED_PATH,
     ALS_USER_MAPPING_PATH,
