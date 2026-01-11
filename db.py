@@ -1,5 +1,5 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy import Column, Float, Integer, String, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 from config import DATABASE_URL
 
@@ -10,6 +10,11 @@ engine = create_engine(
 
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
+
+
+def init_db() -> None:
+    # создаем таблицы, если их нет
+    Base.metadata.create_all(bind=engine)
 
 
 class RequestHistory(Base):
@@ -23,10 +28,12 @@ class RequestHistory(Base):
 
     user_id = Column(Integer)
     requested_k = Column(Integer)
+
     is_cold = Column(Integer)
-
     processing_ms = Column(Float, nullable=False)
-    request_bytes = Column(Integer)
-    token_count = Column(Integer)
-
+    inference_ms = Column(Float)
+    recs_count = Column(Integer)
+    db_write_ms = Column(Float)
+    db_error = Column(Integer)
+    error_type = Column(String)
     error = Column(String)

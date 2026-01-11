@@ -45,21 +45,13 @@ JWT_EXPIRE_MIN = int(os.getenv("JWT_EXPIRE_MIN", "60"))
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
+# HISTORY
+HISTORY_LIMIT_DEFAULT = 100
+HISTORY_LIMIT_MAX = 1000
+
 # VALIDATION
 if not JWT_SECRET:
     raise RuntimeError("JWT_SECRET is not set")
 
 if not ADMIN_PASSWORD:
     raise RuntimeError("ADMIN_PASSWORD is not set")
-
-
-
-
-
-
-
-
-
-
-
-
