@@ -6,13 +6,23 @@ import zipfile
 from pathlib import Path
 from tqdm import tqdm
 
-import dask.dataframe as dd
+import polars as pl
 
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "raw"
 
 OWNER_SLUG = "thunderpede"
 DATASET_SLUG = "testststs"
+
+
+def _scan_parquet(path: Path) -> pl.LazyFrame:
+    path = Path(path)
+
+    if path.is_file():
+        return pl.scan_parquet(str(path))
+
+    parquet_glob = str(path / "**" / "*.parquet")
+    return pl.scan_parquet(parquet_glob, hive_partitioning=True)
 
 
 def dataset_ok() -> bool:
@@ -143,7 +153,7 @@ def load_orders(train: bool = True):
         path = DATA_DIR / "ml_ozon_recsys_train_final_apparel_orders_data"
     else:
         path = DATA_DIR / "archive_extra_orders_data" / "final_apparel_orders_data_07"
-    return dd.read_parquet(path)
+    return _scan_parquet(path)
 
 
 def load_interactions(train: bool = True):
@@ -151,14 +161,14 @@ def load_interactions(train: bool = True):
         path = DATA_DIR / "ml_ozon_recsys_train_final_apparel_tracker_data"
     else:
         path = DATA_DIR / "final_apparel_tracker_data_08_action_widget"
-    return dd.read_parquet(path)
+    return _scan_parquet(path)
 
 
 def load_items():
     path = DATA_DIR / "ml_ozon_recsys_train_final_apparel_items_data"
-    return dd.read_parquet(path)
+    return _scan_parquet(path)
 
 
 def load_categories():
     path = DATA_DIR / "ml_ozon_recsys_train_final_categories_tree"
-    return dd.read_parquet(path)
+    return _scan_parquet(path)
