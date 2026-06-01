@@ -392,7 +392,8 @@ def main() -> int:
     n_shards_to_run = 1 if args.user_shard is not None else args.num_user_shards
 
     print(f"split={args.split}  shards={n_shards_to_run}  top_k={args.top_k}")
-    print(f"context: {win['context_start']} → {win['context_end']}")
+    sys.stdout.reconfigure(encoding="utf-8")
+    print(f"context: {win['context_start']} -> {win['context_end']}")
     print(f"output:  {out_root / args.split}")
     if args.dry_run:
         print("(DRY-RUN — no files will be written)")
