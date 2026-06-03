@@ -1,0 +1,130 @@
+# ── Локальный MLflow Tracking Server + MinIO (S3-compatible storage) ───────────
+# Запуск:  docker compose up -d --build
+# MLflow UI:   http://localhost:5000
+# MinIO UI:    http://localhost:9001  (логин/пароль из .env)
+# MinIO S3:    http://localhost:9000
+# PostgreSQL:  localhost:5432
+
+services:
+
+  # ── PostgreSQL: backend store для MLflow metadata ───────────────────────────
+  postgres:
+    container_name: recsys_postgres
+    image: postgres:16.2
+    env_file:
+      - ./.env
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./build/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mlflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── MinIO: S3-compatible artifact storage ────────────────────────────────────
+  minio:
+    image: quay.io/minio/minio
+    container_name: recsys_minio
+    restart: unless-stopped
+    ports:
+      - "${S3_API_PORT:-9000}:9000"   # S3 API
+      - "${S3_UI_PORT:-9001}:9001"    # Web console
+    env_file:
+      - ./.env
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── MinIO Client: создаёт bucket после того как MinIO поднялся ──────────────
+  mc:
+    image: quay.io/minio/mc
+    container_name: recsys_minio_mc
+    env_file: ./.env
+    networks:
+      - internal
+    entrypoint: >
+      sh -c "
+      mc alias set minio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing minio/${DEFAULT_BUCKET_NAME} &&
+      echo 'Bucket ${DEFAULT_BUCKET_NAME} ready'
+      "
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: on-failure
+
+  # ── MLflow Tracking Server ────────────────────────────────────────────────────
+  mlflow:
+    build:
+      context: ./build
+      dockerfile: Dockerfile
+    container_name: recsys_mlflow
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      POSTGRES_USER:           ${POSTGRES_USER}
+      POSTGRES_PASSWORD:       ${POSTGRES_PASSWORD}
+      POSTGRES_DB:             ${POSTGRES_DB}
+      MLFLOW_S3_ENDPOINT_URL:  http://minio:9000
+      AWS_ACCESS_KEY_ID:       ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY:   ${MINIO_ROOT_PASSWORD}
+      MLFLOW_S3_IGNORE_TLS:    "true"
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        mlflow server \
+          --host 0.0.0.0 \
+          --port 5000 \
+          --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB} \
+          --default-artifact-root s3://${DEFAULT_BUCKET_NAME}/mlflow \
+          --artifacts-destination s3://${DEFAULT_BUCKET_NAME}/mlflow \
+          --serve-artifacts
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  # Named volumes — данные хранятся в Docker volume store
+  # (bind mounts под Windows требуют дополнительных прав для postgres)
+  postgres_data:
+  minio_data:
+
+networks:
+  internal:
+    driver: bridge
