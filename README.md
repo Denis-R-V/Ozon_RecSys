@@ -1,246 +1,245 @@
-# Рекомендательная система fashion‑товаров на Ozon
+# Рекомендательная система fashion-товаров на Ozon
 
-## Команда проекта:
-- участники:
-    - Денис Рябинин
-    - Дарья Клоконос
-    - Виталий Минькевич
-- куратор проекта:
-    - Александра Ковалева
+## Команда
 
-### Распределение ролей:
-Каждый участник команды участвует в реализации каждого этапа и далее выбирается лучшее решение
+- Денис Рябинин
+- Дарья Клоконос
+- Виталий Минькевич
+- куратор: Александра Ковалева
 
-## Цель проекта
-В рамках проекта необходимо разработать масштабируемую систему рекомендаций типа "user-to-item", способную обрабатывать большой объем разнородных данных и формировать для каждого пользователя индивидуальный список из 100 товаров категории Apparel (одежда, обувь, аксессуары), которые с наибольшей вероятностью будут куплены (оформлен заказ).
+Каждый участник работал на всех этапах, из нескольких вариантов выбирался лучший результат.
 
-## Метрика
-- NDCG@100 на тестовой выборке (ml_ozon_recsys_test.snappy.parquet)
+---
 
-## Данные для обучения
-Данные для обучения предоставлены Ozon и включают несколько источников:
-- История взаимодействий пользователей с товарами (трекер событий): ~1,6 млрд событий за 6 месяцев (просмотры товаров, добавления в корзину, добавления в избранное, покупки и др.).
-- История заказов: ~19 млн записей о заказах за тот же период с указанием финального статуса каждого заказа (доставлен, отменён, в процессе и т.п.).
-- Каталог товаров: ~6,4 млн товаров категории Apparel с их атрибутами (текстовые, числовые, категориальные признаки) и готовыми эмбеддингами изображений товаров (512-мерные CLIP-эмбеддинги, специально дообученные под fashion-сегмент).
-- Иерархия категорий товаров: дерево из ~7 тыс. категорий, к которым относятся товары.
-- Дополнительные данные: предоставлен вспомогательный датасет (extra_ml_ozon_recsys_train.zip)
+## Задача
 
-## План работы
-1. Постановка задачи и планирование
-2. Сбор данных и EDA
-3. Разработка бейзлайна без использования ML
-4. Разработка линейных моделей ML
-5. Разработка нелинейных моделей ML, feature-engineering и выбор лучшего ML-решения
-6. Создание сервиса с имплементацией лучшего ML-решения
-7. Разработка DL-модели
-8. Доработка задачи: улучшение сервисной части по обратной связи от команды курса П.Р.; тюнинг DL-моделей и выбор лучшего решения overall
+Построить систему рекомендаций «user-item»: для каждого пользователя сформировать персональный список из 100 товаров категории Apparel (одежда, обувь, аксессуары), которые он с наибольшей вероятностью купит.
+
+**Метрика:** NDCG@100 на тестовой выборке.
+
+---
+
+## Данные
+
+Данные предоставлены Ozon:
+
+- **Трекер событий** - около 1,6 млрд взаимодействий за 6 месяцев: просмотры, корзина, избранное, покупки
+- **История заказов** - около 19 млн записей с финальным статусом
+- **Каталог товаров** - 6,4 млн позиций Apparel с атрибутами и 512-мерными CLIP-эмбеддингами
+- **Дерево категорий** - около 7 тыс. категорий
+- **Дополнительный датасет** - extra_ml_ozon_recsys_train.zip
+
+Общий объем данных и артефактов - более 500 ГБ, поэтому трекинг экспериментов и хранение артефактов развернуты локально (MLflow + MinIO).
+
+---
+
+## Результаты
+
+Прогресс по чекпойнтам:
+
+| Этап | NDCG@100 | Recall@100 |
+|------|----------|------------|
+| TopPopular | 0.005 | 0.017 |
+| ALS | 0.016 | 0.054  |
+| ALS + CatBoost реранкер | 0.029 | 0.098 |
+| **Финальная 2-stage модель, (val)** | **0.088** | **0.146** |
+| **Финальная 2-stage модель, (test)** | **0.088** | **0.152** |
+
+Финальная модель в 17 раз лучше TopPopular и в 5 раз лучше ALS. Метрики на val и test практически совпадают - переобучения нет.
+
+---
+
+## Архитектура финального решения
+
+Двухэтапная система:
+
+1. **Retrieval** - несколько кандидатогенераторов параллельно, итого до ~1400 кандидатов на пользователя.
+2. **Reranking** - LightGBM LambdaRank на 240 числовых признаках (пользователь, товар, категория, кандидат).
+
+Кандидаты и фичи хранятся в parquet-шардах (512 шардов). FastAPI-сервис делает только скоринг - без пересчета кандидатов и фичей онлайн.
+
+### Кандидатогенераторы
+
+| Модель | Тип | Что дает |
+|--------|-----|----------|
+| **TopPopular** | Неперсонализированный | Глобально популярные товары, основной бейзлайн, для холодных пользователей |
+| **UserCategoryPopular** | Слабо персонализированный | Популярные товары в предпочтительных категориях пользователя |
+| **Repeat history** | Персональный | История повторных покупок пользователя; дал сильный прирост |
+| **ALS** | Коллаборативная фильтрация | Матричное разложение на матрице взаимодействий; матрица ~50 ГБ, обучается по шардам |
+| **I2I BM25** | Item-to-item | Похожие товары на основе co-occurrence в сессиях |
+| **CLIP + HNSW** | Визуальная похожесть | Поиск по 512-мерным эмбеддингам изображений через HNSW-индекс |
+| **DSSM** | DL two-tower | Совместное обучение эмбеддингов пользователя и товара; дал хороший прирост recall |
+| **BERT4Rec** | DL sequential | Трансформер на последовательности взаимодействий; recall прирост слабый |
+| **SASRec** | DL sequential | Self-attention sequential recommender; recall прирост слабый |
+
+### Реранкер
+
+LightGBM LambdaRank обучен на объединенном пуле кандидатов (~450 млн строк для val). Признаки - 240 числовых фичей: ранги и скоры каждого кандидатогенератора, агрегаты по пользователю, товару и категории в четырех временных окнах (7, 14, 30, 60 дней).
+
+---
 
 ## Структура ноутбуков
 
-| Ноутбук | Описание |
-|---------|----------|
-| `notebooks/1_EDA.ipynb` | Разведочный анализ данных |
-| `notebooks/2_datamart.ipynb` | Построение datamart / feature store |
-| `notebooks/3_retrieval.ipynb` | Кандидатогенераторы (TopPopular, ALS, repeat-history, i2i) |
-| `notebooks/4_DL_*.ipynb` | DL-модели (BERT4Rec, DSSM, SASRec) + merge |
-| `notebooks/5_reranker.ipynb` | **Финальный реранкер** (2-stage: retrieval → LightGBM ranker) + MLflow PRD run + baseline comparison |
-| `notebooks/6_prd_inference.ipynb` | Загрузка PRD-модели из MLflow, тестовый predict |
+| Ноутбук | Что внутри |
+|---------|------------|
+| `notebooks/1_EDA.ipynb` | Разведочный анализ |
+| `notebooks/2_datamart.ipynb` | Построение datamart и feature store |
+| `notebooks/3_retrieval.ipynb` | Кандидатогенераторы: TopPopular, ALS, repeat-history, I2I |
+| `notebooks/4_DL_*.ipynb` | DSSM, BERT4Rec, SASRec - обучение и инференс |
+| `notebooks/5_reranker.ipynb` | Финальный реранкер, логгирование в MLflow, сравнение с бейзлайнами |
+| `notebooks/6_prd_inference.ipynb` | Загрузка финальной модели из MLflow, тестовый predict |
 
-## Результаты финальной модели
+---
 
-Пул кандидатов: `merged_with_dl_all_repeat_history`, 512 шардов.  
-Модель: LightGBM LambdaRank (`lgbm_ranker_t02_selection`).
+## Запуск инфраструктуры (MLflow + MinIO)
 
-| Разбивка | NDCG@100 | recall@100 | Примечание |
-|----------|----------|-----------|-----------|
-| TopPopular (baseline) | 0.005056 | 0.017450 | val_eval |
-| ALS (baseline) | 0.004486 | 0.015342 | val_eval |
-| Candidate raw rank (baseline) | 0.029241 | 0.097569 | val_eval |
-| **2-stage reranker — val_eval** | **0.087751** | **0.145960** | финальная модель, val holdout |
-| **2-stage reranker — test holdout** | **0.088141** | **0.151671** | Jul 2–15, честный тест |
-
-Улучшение vs лучший baseline: **×17x** по NDCG@100.  
-Ratio test/val = **1.00×** — модель обобщается без деградации.  
-PRD run_id сохранён в `artifacts/reports/.../prd_run_id.txt`.
-
-## Финальный статус чекпойнта
-
-### Сравнение методов (val_eval, одинаковый пул кандидатов)
-
-> График и таблица сохранены в MLflow artifact `reports/model_comparison.png`
-> и `reports/model_comparison.csv` (PRD run `6e08071b`).
-
-| Метод | NDCG@100 | Recall@100 | ×lift vs TopPop | ×lift vs best baseline |
-|-------|----------|-----------|-----------------|------------------------|
-| TopPopular | 0.005056 | 0.017450 | 1.0× | — |
-| ALS | 0.004486 | 0.015342 | 0.9× | — |
-| Candidate raw rank | 0.029241 | 0.097569 | 5.8× | 1.0× |
-| **2-stage reranker (PRD)** | **0.087751** | **0.145960** | **17.4×** | **3.0×** |
-
-### Параметры чекпойнта
-
-| Параметр | Значение |
-|----------|----------|
-| **MLflow UI** | http://localhost:5000 |
-| **MinIO UI** | http://localhost:9001 (minioadmin / minioadmin) |
-| **PRD run_id** | `6e08071b6021407a8ed6c9dd28318a8b` |
-| **Финальная модель** | 2-stage: retrieval (ALS + TopPop + DL + repeat-hist) → LightGBM ranker |
-| **Inference notebook** | `notebooks/6_prd_inference.ipynb` — выполнен, модель из MLflow/MinIO artifact |
-
-### Что залоггировано в PRD run
-
-| Путь в MLflow | Описание |
-|---------------|----------|
-| `model/lgbm_ranker_t02_selection.joblib` | Обученная модель LightGBM |
-| `model/feature_cols.json` | Список фич (240 numeric) |
-| `notebooks/6_prd_inference.ipynb` | Выполненный inference-ноутбук |
-| `reports/final_reranker_best_val_metrics.parquet` | Val-метрики финальной модели |
-| `reports/final_reranker_baseline_val_metrics.parquet` | Метрики бейзлайнов |
-| `reports/error_analysis_samples.parquet` | 20 конкретных примеров ошибок ранкера |
-| `reports/error_analysis_summary.parquet` | Сводка по категориям ошибок |
-| `reports/feature_importance.png` | График top-30 важности признаков |
-| `reports/v12_feature_importance.csv` | Feature importance (raw) |
-| `reports/baseline_comparison.parquet` | Сравнение бейзлайн vs финальная модель |
-| `reports/run_config.json` | Конфигурация обучения |
-| `reports/versions.json` | Версии библиотек |
-| `reports/requirements_snapshot.txt` | Снапшот зависимостей |
-
-### Дологгировать позже (при наличии)
-- `robustness_report.parquet` — проверка устойчивости (требует `production_record` в памяти)
-
-## MLflow + MinIO — быстрый старт
-
-### Требования
-- Docker Desktop ≥ 4.0 и `docker compose` v2
-
-### Запуск инфраструктуры
+Для воспроизведения обучения нужен Docker.
 
 ```bash
-# 1. Скопировать .env
-copy .env.example .env          # Windows
-# cp .env.example .env          # Linux/Mac
+# Скопировать конфиг
+copy .env.example .env   # Windows
+# cp .env.example .env   # Linux/Mac
 
-# 2. Запустить MLflow + MinIO
+# Поднять MLflow + MinIO + PostgreSQL
 docker compose up -d
 
-# 3. Дождаться ready (обычно 30-60 сек)
-docker compose ps               # STATUS должен быть healthy/running
+# Подождать и проверить статус
+docker compose ps
 ```
 
-| Сервис | URL | Логин |
-|--------|-----|-------|
-| **MLflow UI** | http://localhost:5000 | — |
-| **MinIO Console** | http://localhost:9001 | minioadmin / minioadmin |
-| MinIO S3 API | http://localhost:9000 | — |
+| Сервис | Адрес | Логин |
+|--------|-------|-------|
+| MLflow UI | http://localhost:5000 | - |
+| MinIO Console | http://localhost:9001 | minioadmin / minioadmin |
 
-> Bucket `mlflow-artifacts` создаётся автоматически при старте.
-
-### Остановка
+Bucket `mlflow-artifacts` создается автоматически.
 
 ```bash
-docker compose down             # остановить (данные сохраняются в Docker volumes)
-docker compose down -v          # остановить + удалить volumes
+# Остановить
+docker compose down
+
+# Остановить и удалить volumes
+docker compose down -v
 ```
 
-### Запуск финального обучения и PRD-логгирования
+---
+
+## Воспроизведение обучения
+
+Полный пайплайн воспроизводится последовательно через ноутбуки. Требуются исходные данные.
 
 ```bash
-# Установить зависимости (если ещё не установлены)
 pip install -r requirements.txt
-
-# Открыть ноутбук
-jupyter notebook notebooks/5_reranker.ipynb
-
-# Запустить ячейки:
-# - 1-32  : обучение реранкера (можно пропустить если артефакты уже есть)
-# - 33-34 : reproducibility snapshot (versions.json, run_config.json)
-# - 35-36 : MLflow setup (ТРЕБУЕТ запущенного docker compose up -d)
-# - 37-38 : логгирование PRD run → артефакты в MinIO
-# - 39-40 : baseline comparison (читает из уже посчитанного parquet)
 ```
 
-### Загрузка PRD-модели (inference)
+**1. Datamart и feature store** - `notebooks/2_datamart.ipynb`
+Строит агрегированные фичи пользователей, товаров и категорий в четырех временных окнах. Результат сохраняется в `data/datamart/`.
+
+**2. Кандидатогенераторы** - `notebooks/3_retrieval.ipynb`
+Обучает ALS, строит индексы для CLIP+HNSW и I2I BM25, формирует пул кандидатов для val и test. Результат - ~450 млн строк по шардам в `data/datamart/candidates/`.
+
+**3. DL-модели** - `notebooks/4_DL_*.ipynb`
+Обучает DSSM, BERT4Rec, SASRec на последовательностях взаимодействий. Дообученные кандидаты мержатся с retrieval-пулом.
+
+**4. Финальный реранкер** - `notebooks/5_reranker.ipynb`
+Обучает LightGBM LambdaRank на объединенном пуле кандидатов с фичами из datamart. Для логгирования в MLflow нужен запущенный Docker:
+
+```bash
+docker compose up -d
+jupyter notebook notebooks/5_reranker.ipynb
+```
+
+**5. Проверка инференса** - `notebooks/6_prd_inference.ipynb`
+Загружает финальную модель из MLflow, делает тестовый predict.
 
 ```bash
 jupyter notebook notebooks/6_prd_inference.ipynb
 ```
 
-### Переменные окружения для ноутбука
+---
+
+## FastAPI-сервис
+
+Сервис делает только онлайн-скоринг через LightGBM. Кандидаты и фичи читаются из заранее подготовленных parquet-файлов через DuckDB.
+
+### Подготовка данных для демо (для простого инференса не нужно)
 
 ```bash
-# .env (копия .env.example)
-MLFLOW_TRACKING_URI=http://localhost:5000
-MLFLOW_EXPERIMENT_NAME=recsys_reranker
-MLFLOW_S3_ENDPOINT_URL=http://localhost:9000
-AWS_ACCESS_KEY_ID=minioadmin
-AWS_SECRET_ACCESS_KEY=minioadmin
+conda activate recsys
+
+# Собрать demo store
+python scripts/build_api_demo_store.py --n-demo-users 100 --max-tracker-files 50
+
+# Проверить, что модель корректно загружается и скорит
+python scripts/smoke_api_store.py
 ```
 
-> **Без Docker:** если `MLFLOW_TRACKING_URI` не задан или сервер недоступен,
-> ноутбук автоматически использует локальный трекинг (`./mlruns`) — без MinIO.
-
-### Воспроизведение обучения
+### Запуск
 
 ```bash
-# Установить зависимости
 pip install -r requirements.txt
 
-# Запустить финальный реранкер (все ячейки)
-jupyter notebook notebooks/5_reranker.ipynb
+copy .env.example .env  # задать JWT_SECRET и ADMIN_PASSWORD
 
-# Загрузить PRD-модель и проверить inference
-jupyter notebook notebooks/6_prd_inference.ipynb
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-## Запуск сервиса
-- должен быть установлен Python 3.10+
-- должны быть установлены зависимости из requirements.txt:
-    pip install -r requirements.txt
-- в корне проекта должна присутствовать директория models с файлами модели, маппингов, популярных товаров и товаров, купленных пользователями ([ссылка](https://disk.yandex.ru/d/dpCwLMmqQjXoJA))
-- в корне проекта должен присутствовать файл .env (скопировать содержимое .env.example и изменить JWT_SECRET и ADMIN_PASSWORD)
-- запуск сервиса:
-    - uvicorn main:app --host 0.0.0.0 --port 8000
-- для доступа к административным эндпоинтам и статистике необходимо получить JWT-токен (эндпоинт /login)
+### Эндпоинты
 
-### Основные эндпоинты:
-- Инференс
-    - POST /forward — получить рекомендации для пользователя
+**Инференс**
 
-- Мониторинг
-    - GET /health — liveness-проверка
-    - GET /health/ready — readiness-проверка (БД + модель)
-    - GET /stats — агрегированные метрики сервиса (admin)
-- Администрирование
-    - GET /history — история запросов
-    - DELETE /history — очистка истории
+| Метод | Путь | Описание |
+|-------|------|----------|
+| POST | `/forward` | Рекомендации для пользователя: `{user_id, k}` → `{user_id, recommendations}` |
+| GET | `/recommendations/{user_id}` | То же, но с оценками, названиями товаров, категориями и источниками |
 
-### Примеры запросов: 
-- Инференс рекомендаций:
-curl -X POST \
-  'http://127.0.0.1:8000/forward' \
-  -H 'accept: application/json' \
+**Демо**
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| GET | `/demo/users` | Список пользователей из demo store с метриками |
+| GET | `/demo/user/{user_id}` | История, рекомендации, что купил из топ-k, что купил без рекомендаций |
+| GET | `/model/info` | Информация о финальной модели и метрики |
+
+**Мониторинг и администрирование**
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| GET | `/health` | Проверка доступности сервиса |
+| GET | `/health/ready` | Проверка готовности: БД, модель, данные |
+| GET | `/stats` | Агрегированные метрики сервиса (admin) |
+| POST | `/login` | Получить JWT-токен |
+| GET | `/history` | История запросов (admin) |
+| DELETE | `/history` | Очистить историю (admin) |
+
+### Примеры
+
+```bash
+# Рекомендации (совместимый формат)
+curl -X POST http://localhost:8000/forward \
   -H 'Content-Type: application/json' \
-  -d '{
-    "user_id": 3423970,
-    "k": 100
-  }'
-    - ответ: {
-  "user_id": 3423970,
-  "recommendations": [12345, 67890, 11223, ...]
-}
+  -d '{"user_id": 3737600, "k": 20}'
 
-- Получение JWT-токена (admin):
-curl -X POST \
-  'http://127.0.0.1:8000/login' \
-  -H 'accept: application/json' \
-  -H 'Content-Type: application/x-www-form-urlencoded' \
-  -d 'password=password'
-    - ответ: {
-    "access_token": "<JWT_TOKEN>",
-    "token_type": "bearer"
-    }
+# Рекомендации с метаданными
+curl http://localhost:8000/recommendations/3737600?k=20
 
-- Пример запроса с авторизацией:
-curl -X GET \
-  'http://127.0.0.1:8000/history?limit=100' \
-  -H 'Authorization: Bearer <JWT_TOKEN>'
+# Разбор конкретного пользователя
+curl http://localhost:8000/demo/user/3737600?k=20
+
+# Статус сервиса
+curl http://localhost:8000/health/ready
+
+# JWT-токен
+curl -X POST http://localhost:8000/login -d 'password=<ADMIN_PASSWORD>'
+```
+
+### Переменные окружения
+
+Основные переменные задаются в `.env`. Пути к модели и данным можно переопределить:
+
+| Переменная | Описание |
+|------------|----------|
+| `JWT_SECRET` | Секрет для JWT (обязательно) |
+| `ADMIN_PASSWORD` | Пароль администратора (обязательно) |
+| `RANKER_MODEL_PATH` | Путь к весам LightGBM-модели |
+| `CANDIDATE_FEATURES_PATH` | Путь к parquet с кандидатами |
