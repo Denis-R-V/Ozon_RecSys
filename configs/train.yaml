@@ -1,0 +1,44 @@
+# ── Reranker Training Config (Hydra) ──────────────────────────────────────────
+# Usage:
+#   python scripts/train.py
+#   python scripts/train.py model.n_estimators=500 mlflow.run_name=my_run
+#   python scripts/train.py +model.learning_rate=0.05
+
+defaults:
+  - _self_
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  run_name: final_reranker_v12_repeat__merged_with_dl_all_repeat_history
+  train_split: train_fit      # directory name inside dataset/
+  val_split: val_fit          # used for early stopping
+  val_eval_split: val_eval    # used for final metric evaluation
+  max_train_rows: 6_000_000
+  max_val_rows: 2_000_000
+  random_state: 42
+
+# ── Model hyperparameters (best Optuna trial) ──────────────────────────────────
+model:
+  n_estimators: 1173
+  learning_rate: 0.06862917941744148
+  max_depth: 13
+  num_leaves: 182
+  min_child_samples: 217
+  colsample_bytree: 0.6809723757181718
+  subsample: 0.9726559822580909
+  reg_alpha: 0.0001499329805509155
+  reg_lambda: 0.000018679434894556
+  lambdarank_truncation_level: 99
+  early_stopping_rounds: 100
+  positive_weight: 8.0
+  optimize_metric: ndcg@100
+
+# ── MLflow ────────────────────────────────────────────────────────────────────
+mlflow:
+  tracking_uri: http://localhost:5000
+  experiment_name: recsys_reranker
+  run_name: lgbm_reranker_cli
+  tags:
+    architecture: 2stage_retrieval_rerank
+    stage2_reranker: lightgbm_lambdarank
+    source: hydra_cli
