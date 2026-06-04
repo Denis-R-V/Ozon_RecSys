@@ -1,3 +1,5 @@
 .env
+artifacts/
 data/
 models/
+__pycache__/

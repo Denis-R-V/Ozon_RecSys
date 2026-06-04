@@ -1,0 +1,10 @@
+datamart:
+  layers:
+    - raw
+    - aggs
+
+  overwrite: true
+
+  # false — для обучения/валидации
+  # true — для финального inference, если нужно добавить eval-историю
+  include_eval_sources: false
