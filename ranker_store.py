@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+from collections import Counter
 from typing import Any
 
 import duckdb
@@ -41,7 +42,21 @@ _SOURCE_FLAG_LABELS: dict[str, str] = {
     "is_repeat_history_candidate": "repeat_history",
 }
 
-_PURCHASE_ACTION_TYPES = frozenset({"to_cart", "order", "purchase", "buy"})
+_PURCHASE_ACTION_TYPES = frozenset({"order", "purchase", "buy"})
+_NEGATIVE_ACTION_TYPES = frozenset({"unfavorite", "remove"})  # not positive signals
+
+# Higher = stronger user intent signal
+_ACTION_STRENGTH: dict[str, int] = {
+    "order":            7,
+    "purchase":         7,
+    "buy":              7,
+    "to_cart":          6,
+    "favorite":         5,
+    "review_view":      3,
+    "view_description": 2,
+    "page_view":        1,
+    "remove":           0,
+}
 
 
 class RankerStore:
@@ -60,6 +75,7 @@ class RankerStore:
         future_events: pd.DataFrame,
         popular_items: pd.DataFrame,
         model_info: dict,
+        split_info: dict | None = None,
         duckdb_threads: int = 2,
     ) -> None:
         self._model = model
@@ -70,6 +86,7 @@ class RankerStore:
         self._future_events = future_events
         self._popular_items = popular_items  # sorted by global_pop_rank
         self._model_info = model_info
+        self._split_info: dict = split_info or {}
         self._duckdb_threads = duckdb_threads
 
         # Pre-build sets/indices for O(1) lookup
@@ -141,6 +158,26 @@ class RankerStore:
         if info_path.exists():
             model_info = json.loads(info_path.read_text(encoding="utf-8"))
 
+        # Split info JSON (optional — describes data sources and temporal windows)
+        split_info: dict = {}
+        split_info_path = candidates_path.parent / "split_info.json"
+        if split_info_path.exists():
+            split_info = json.loads(split_info_path.read_text(encoding="utf-8"))
+            log.info("split_info.json loaded")
+        else:
+            # Fallback: hard-coded defaults based on known build_api_demo_store.py sources
+            split_info = {
+                "candidates_source": "val_eval",
+                "history_source": "train_tracker",
+                "future_events_source": "test_tracker_08",
+                "label_definition": "val_target_window_positive",
+                "ground_truth_note": (
+                    "MISMATCH: label (val period) != future_events (test period 08). "
+                    "Use label_hits_at_k for metrics consistent with /demo/users sidebar."
+                ),
+            }
+            log.warning("split_info.json not found; using inferred defaults")
+
         store = cls(
             model=model,
             feature_cols=feature_cols,
@@ -150,6 +187,7 @@ class RankerStore:
             future_events=future_events,
             popular_items=popular_items,
             model_info=model_info,
+            split_info=split_info,
             duckdb_threads=getattr(cfg, "DUCKDB_THREADS", 2),
         )
         log.info(
@@ -227,11 +265,19 @@ class RankerStore:
         user_df["_score"] = scores
         user_df = user_df.sort_values("_score", ascending=False).head(k).reset_index(drop=True)
 
-        # Future hit flags
+        has_label_col = "label" in user_df.columns
+
+        # Future hit flags — any interaction vs real purchase only
         future_item_ids: frozenset[int] = frozenset()
+        purchase_item_ids: frozenset[int] = frozenset()
         if not self._future_events.empty and "user_id" in self._future_events.columns:
             fut_user = self._future_events[self._future_events["user_id"] == user_id]
             future_item_ids = frozenset(fut_user["item_id"].astype(int).tolist())
+            if "action_type" in fut_user.columns:
+                _pur = fut_user[
+                    fut_user["action_type"].str.lower().isin(_PURCHASE_ACTION_TYPES)
+                ]
+                purchase_item_ids = frozenset(_pur["item_id"].astype(int).tolist())
 
         # Build response
         recs: list[dict] = []
@@ -240,10 +286,21 @@ class RankerStore:
             meta = self._item_meta_idx.loc[iid] if iid in self._item_meta_idx.index else None
 
             sources = [
-                label
-                for flag, label in _SOURCE_FLAG_LABELS.items()
+                lbl
+                for flag, lbl in _SOURCE_FLAG_LABELS.items()
                 if bool(row.get(flag, False))
             ]
+
+            # Val-period GT: read label value directly from this candidate row.
+            # This is the single source of truth — consistent with /demo/users sidebar.
+            label_value = 0
+            if has_label_col:
+                try:
+                    raw = row["label"]
+                    label_value = int(raw) if pd.notna(raw) else 0
+                except Exception:
+                    label_value = 0
+            val_gt_hit = label_value > 0
 
             recs.append({
                 "rank": rank,
@@ -255,7 +312,12 @@ class RankerStore:
                 "category_name": _safe_str(meta, "category_name") if meta is not None else None,
                 "category_path": _safe_str(meta, "category_path") if meta is not None else None,
                 "sources": sources,
-                "future_hit": iid in future_item_ids,
+                "label": label_value,
+                "val_gt_hit": val_gt_hit,
+                "label_hit": val_gt_hit,                           # backward alias
+                "future_hit": iid in future_item_ids,              # legacy alias
+                "future_interaction_hit": iid in future_item_ids,
+                "bought_after": iid in purchase_item_ids,
                 "is_repeat": bool(row.get("is_repeat_history_candidate", False)),
             })
 
@@ -322,31 +384,32 @@ class RankerStore:
         rows: list[dict] = []
         for uid in user_ids:
             _, recs = self.score_user(uid, k=20)
-            rec_item_ids = {r["item_id"] for r in recs}
 
-            # Candidate store: label-based metrics
-            cand_df = self._query_candidates(uid)
-            cand_count = len(cand_df)
-            label_items: set[int] = set()
-            if "label" in cand_df.columns:
-                label_items = set(
-                    cand_df[cand_df["label"] > 0]["item_id"].astype(int).tolist()
-                )
-            pos_count = len(label_items)
-            label_hits_20 = len(rec_item_ids & label_items)
-            label_recall_20 = label_hits_20 / max(pos_count, 1)
+            # Single shared helper — guarantees identical logic to /demo/story
+            vm = self.get_validation_metrics_for_user(uid, recs)
+            label_hits_20 = vm["label_hits_at_k"]
+            label_recall_20 = vm["label_recall_at_k"]
+            pos_count = vm["positive_count"]
+            cand_count = vm["candidate_count"]
 
             # Future-events-based metrics (hit = item appeared in any future event)
             future_hits_20 = sum(1 for r in recs if r["future_hit"])
             future_hit_rate_20 = future_hits_20 / max(len(recs), 1)
+            purchase_from_recs_20 = sum(1 for r in recs if r.get("bought_after", False))
 
-            # History / future event counts
+            # History / future event counts + purchase count
             hist_count = 0
             if not self._user_history.empty:
                 hist_count = int((self._user_history["user_id"] == uid).sum())
             fut_count = 0
+            purchase_count = 0
             if not self._future_events.empty:
-                fut_count = int((self._future_events["user_id"] == uid).sum())
+                _fut_u = self._future_events[self._future_events["user_id"] == uid]
+                fut_count = len(_fut_u)
+                if not _fut_u.empty and "action_type" in _fut_u.columns:
+                    purchase_count = int(
+                        _fut_u["action_type"].str.lower().isin(_PURCHASE_ACTION_TYPES).sum()
+                    )
 
             # Filter: min_hits applies to label_hits_at_20
             if min_hits is not None and label_hits_20 < min_hits:
@@ -357,6 +420,8 @@ class RankerStore:
                 "candidate_count": cand_count,
                 "positive_count": pos_count,
                 "future_event_count": fut_count,
+                "purchase_count": purchase_count,
+                "purchase_from_recs_20": purchase_from_recs_20,
                 "history_count": hist_count,
                 "label_hits_at_20": label_hits_20,
                 "label_recall_at_20": round(label_recall_20, 4),
@@ -364,7 +429,7 @@ class RankerStore:
                 "future_hit_rate_at_20": round(future_hit_rate_20, 4),
             })
 
-        rows.sort(key=lambda x: x["label_recall_at_20"], reverse=True)
+        rows.sort(key=lambda x: (x["purchase_from_recs_20"], x["purchase_count"]), reverse=True)
         return rows[:limit]
 
     def get_demo_user_full(self, user_id: int, k: int = 20, history_limit: int = 20) -> dict:
@@ -400,7 +465,7 @@ class RankerStore:
         explanation = (
             f"User has {len(history)} tracked interactions "
             f"and {len(future)} future events "
-            f"(including {len(future_purchase_ids)} purchase-like actions). "
+            f"(including {len(future_purchase_ids)} real purchases). "
             f"Model is {'cold-start popular-fallback' if is_cold else 'PRD LightGBM ranker'}. "
             f"{hits_at_k} of top-{k} recommendations were later purchased."
         )
@@ -416,6 +481,384 @@ class RankerStore:
             "recall_at_k": round(recall_at_k, 4),
             "explanation": explanation,
         }
+
+    # ------------------------------------------------------------------ #
+    # Validation metrics helper (single source of truth for both          #
+    # /demo/users and /demo/story)                                        #
+    # ------------------------------------------------------------------ #
+
+    def get_validation_metrics_for_user(
+        self, user_id: int, recommendations: list[dict]
+    ) -> dict:
+        """
+        Compute val-period GT metrics by intersecting top-k rec items with
+        label=1 items from the candidate store.
+
+        This is the ONLY place label metrics are computed.  Both get_demo_users()
+        and get_demo_story() must call this method so sidebar and story always agree.
+
+        Returns:
+            positive_count        - total label=1 items in full candidate set
+            label_hit_item_ids    - sorted list[int] of intersection items
+            label_hits_at_k       - len(intersection)
+            label_recall_at_k     - hits / positive_count  (0.0 if positive_count==0)
+            candidate_count       - total candidate rows for this user
+            has_label_column      - bool, False if parquet has no label column
+        """
+        rec_item_ids: set[int] = {r["item_id"] for r in recommendations}
+
+        label_items: set[int] = set()
+        cand_count = 0
+        has_label_col = False
+        try:
+            cand_df = self._query_candidates(user_id)
+            cand_count = len(cand_df)
+            if not cand_df.empty and "label" in cand_df.columns:
+                has_label_col = True
+                label_items = set(
+                    cand_df[cand_df["label"] > 0]["item_id"].astype(int).tolist()
+                )
+        except Exception as exc:
+            log.warning("get_validation_metrics_for_user: _query_candidates failed: %s", exc)
+
+        hit_set = label_items & rec_item_ids
+        label_hit_item_ids: list[int] = sorted(hit_set)
+        positive_count = len(label_items)
+        label_hits_at_k = len(label_hit_item_ids)
+        label_recall_at_k = label_hits_at_k / positive_count if positive_count > 0 else 0.0
+
+        return {
+            "positive_count": positive_count,
+            "label_hit_item_ids": label_hit_item_ids,
+            "label_hits_at_k": label_hits_at_k,
+            "label_recall_at_k": round(label_recall_at_k, 4),
+            "candidate_count": cand_count,
+            "has_label_column": has_label_col,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Demo story                                                           #
+    # ------------------------------------------------------------------ #
+
+    def get_demo_story(
+        self,
+        user_id: int,
+        k: int = 20,
+        history_limit: int = 20,
+        analysis_k: int = 100,
+    ) -> dict:
+        """
+        Aggregated view-model for Streamlit demo.
+        Returns one JSON with everything needed to render the full user story:
+        profile, history, recommendations, what-happened-later, charts.
+
+        k           — number of cards to display in the UI.
+        analysis_k  — candidate pool size for bought/interaction analysis.
+                      Always >= k. Buying/interaction rates computed over this pool.
+        """
+        _score_k = max(k, analysis_k)
+        is_cold, recs_all = self.score_user(user_id, k=_score_k)
+        # Display slice (UI table)
+        history = self.get_user_history(user_id, limit=history_limit)
+        # Full history for badge computation — history_limit may be only last 20 events,
+        # but strongest_history_action must reflect the entire known history
+        _hist_full = self.get_user_history(user_id, limit=5000)
+        future_events = self.get_future_events(user_id)
+
+        # Build history-by-item using FULL history so all recommended items get correct badges
+        hist_by_item: dict[int, list[dict]] = {}
+        for _hh in _hist_full:
+            hist_by_item.setdefault(_hh["item_id"], []).append(_hh)
+
+        # Annotate every candidate with strongest history action (pre-test signal)
+        for _r in recs_all:
+            _h_evts = hist_by_item.get(_r["item_id"], [])
+            if _h_evts:
+                _hb = max(
+                    _h_evts,
+                    key=lambda e: _ACTION_STRENGTH.get((e.get("action_type") or "").lower(), 0),
+                )
+                _r["strongest_history_action"] = _hb.get("action_type")
+            else:
+                _r["strongest_history_action"] = None
+
+        # Display set (top-k cards); analysis set (top-analysis_k) keeps full recs_all
+        recs = recs_all[:k]
+
+        rec_item_ids = {r["item_id"] for r in recs_all}   # analysis pool
+        rec_by_id    = {r["item_id"]: r for r in recs_all}
+
+        future_purchase_events = [
+            e for e in future_events
+            if e.get("action_type", "").lower() in _PURCHASE_ACTION_TYPES
+        ]
+        future_purchase_ids = {e["item_id"] for e in future_purchase_events}
+
+        # Group future events by item_id for O(1) per-rec lookup
+        fut_by_item: dict[int, list[dict]] = {}
+        for _fe in future_events:
+            fut_by_item.setdefault(_fe["item_id"], []).append(_fe)
+
+        # Annotate recs with later interaction info (applied to full analysis pool)
+        for _r in recs_all:
+            _evts     = fut_by_item.get(_r["item_id"], [])
+            # Exclude negative/removal signals from positive interaction logic
+            _pos_evts = [
+                e for e in _evts
+                if (e.get("action_type") or "").lower() not in _NEGATIVE_ACTION_TYPES
+            ]
+            if _pos_evts:
+                _best = max(
+                    _pos_evts,
+                    key=lambda e: _ACTION_STRENGTH.get((e.get("action_type") or "").lower(), 0),
+                )
+                _r["strongest_later_action"]    = _best.get("action_type")
+                _r["strongest_later_action_ts"] = _best.get("timestamp")
+            else:
+                _r["strongest_later_action"]    = None
+                _r["strongest_later_action_ts"] = None
+            _r["bought_after"]      = _r["item_id"] in future_purchase_ids
+            _r["later_interaction"] = bool(_pos_evts)
+
+        # Enriched bought_from_recommendations (sorted by rank)
+        bought_from_recs = []
+        for iid in sorted(rec_item_ids & future_purchase_ids, key=lambda x: rec_by_id[x]["rank"]):
+            rec = rec_by_id[iid]
+            bought_from_recs.append({
+                "item_id": iid,
+                "title": rec.get("title"),
+                "brand": rec.get("brand"),
+                "category_name": rec.get("category_name"),
+                "rank_in_recommendations": rec["rank"],
+                "score": rec["score"],
+                "action_type": rec.get("strongest_later_action"),
+                "timestamp": rec.get("strongest_later_action_ts"),
+            })
+
+        # Enriched bought_not_recommended (deduplicated by item_id)
+        seen_not_rec: set[int] = set()
+        bought_not_rec = []
+        for e in future_purchase_events:
+            iid = e["item_id"]
+            if iid in rec_item_ids or iid in seen_not_rec:
+                continue
+            seen_not_rec.add(iid)
+            meta = self._item_meta_idx.loc[iid] if iid in self._item_meta_idx.index else None
+            bought_not_rec.append({
+                "item_id": iid,
+                "title": e.get("title") or (_safe_str(meta, "title") if meta is not None else None),
+                "brand": _safe_str(meta, "brand") if meta is not None else None,
+                "category_name": (
+                    e.get("category_name")
+                    or (_safe_str(meta, "category_name") if meta is not None else None)
+                ),
+                "action_type": e.get("action_type"),
+                "timestamp": e.get("timestamp"),
+            })
+
+        # Enrich not-recommended purchases with context flags (vs full analysis pool)
+        rec_categories = {r.get("category_name") for r in recs_all if r.get("category_name")}
+        rec_brands      = {r.get("brand") for r in recs_all if r.get("brand")}
+        for _nr in bought_not_rec:
+            _nr["category_was_recommended"] = _nr.get("category_name") in rec_categories
+            _nr["brand_was_recommended"]    = _nr.get("brand") in rec_brands
+
+        bought_from_recs_count = len(bought_from_recs)
+        purchase_recall_at_k = bought_from_recs_count / max(len(future_purchase_ids), 1)
+        future_interaction_hits_at_k = sum(1 for r in recs_all if r.get("future_interaction_hit"))
+        future_interaction_rate_at_k = future_interaction_hits_at_k / max(len(recs_all), 1)
+
+        # Val-period GT — single shared helper, same logic as /demo/users sidebar.
+        # Patches val_gt_hit/label_hit on the display set only.
+        vm = self.get_validation_metrics_for_user(user_id, recs_all)
+        hit_set: set[int] = set(vm["label_hit_item_ids"])
+        for r in recs_all:
+            r["val_gt_hit"] = r["item_id"] in hit_set
+            r["label_hit"] = r["val_gt_hit"]
+
+        # Non-purchase interactions from recommendations (positive actions only, no unfavorite/remove)
+        later_int_from_recs = [
+            {
+                "item_id": r["item_id"],
+                "title": r.get("title"),
+                "brand": r.get("brand"),
+                "category_name": r.get("category_name"),
+                "rank_in_recommendations": r["rank"],
+                "score": r["score"],
+                "action_type": r.get("strongest_later_action"),
+                "timestamp": r.get("strongest_later_action_ts"),
+            }
+            for r in recs_all
+            if r.get("later_interaction") and not r.get("bought_after")
+        ]
+
+        # Enrich history items with brand/item_type from metadata
+        for _h in history:
+            _hid   = _h["item_id"]
+            _hmeta = self._item_meta_idx.loc[_hid] if _hid in self._item_meta_idx.index else None
+            if _hmeta is not None:
+                if not _h.get("brand"):
+                    _h["brand"]     = _safe_str(_hmeta, "brand")
+                if not _h.get("item_type"):
+                    _h["item_type"] = _safe_str(_hmeta, "item_type")
+
+        top_cat_hist: Counter = Counter(
+            e["category_name"] for e in history if e.get("category_name")
+        )
+        top_categories = [cat for cat, _ in top_cat_hist.most_common(5)]
+
+        # Recommended items with any later interaction — from full analysis pool
+        recommended_with_later = [
+            {
+                "rank":             r["rank"],
+                "item_id":          r["item_id"],
+                "title":            r.get("title"),
+                "brand":            r.get("brand"),
+                "category_name":    r.get("category_name"),
+                "score":            r["score"],
+                "strongest_action": r.get("strongest_later_action"),
+                "timestamp":        r.get("strongest_later_action_ts"),
+                "is_purchase":      r.get("bought_after", False),
+            }
+            for r in recs_all
+            if r.get("later_interaction")
+        ]
+
+        # Summary block — counts over full analysis pool
+        _all_strongest = [r["strongest_later_action"] for r in recs_all if r.get("strongest_later_action")]
+        _best_overall  = (
+            max(_all_strongest, key=lambda a: _ACTION_STRENGTH.get(a.lower(), 0))
+            if _all_strongest else None
+        )
+        summary = {
+            "strongest_recommended_action":         _best_overall,
+            "recommended_later_interactions_count": sum(1 for r in recs_all if r.get("later_interaction")),
+            "recommended_bought_count":      sum(1 for r in recs_all if r.get("bought_after")),
+            "not_recommended_bought_count":  len(bought_not_rec),
+        }
+
+        # Analysis block — over full analysis pool
+        _hist_cat_cnt   = Counter(e.get("category_name") for e in history if e.get("category_name"))
+        _rec_cat_cnt    = Counter(r.get("category_name") for r in recs_all if r.get("category_name"))
+        _hist_brand_cnt = Counter(e["brand"] for e in history if e.get("brand"))
+        _n_seen         = sum(1 for r in recs_all if r.get("is_repeat"))
+        analysis_block = {
+            "history_top_categories":    [{"category": c, "count": n} for c, n in _hist_cat_cnt.most_common(10)],
+            "recommendation_categories": [{"category": c, "count": n} for c, n in _rec_cat_cnt.most_common(10)],
+            "history_top_brands":        [{"brand": b, "count": n} for b, n in _hist_brand_cnt.most_common(5)],
+            "category_overlap":          sorted(set(_hist_cat_cnt) & set(_rec_cat_cnt)),
+            "category_miss":             sorted(set(_hist_cat_cnt) - set(_rec_cat_cnt)),
+            "source_distribution":       self._source_distribution(recs_all),
+            "seen_before_count":         _n_seen,
+            "new_items_count":           len(recs_all) - _n_seen,
+        }
+
+        # Lightweight model section (no artifact_status, no health_checks)
+        mi = self._model_info
+        model_section = {
+            "model_name": mi.get("model_name", "prd_reranker"),
+            "prd_run_id": mi.get("prd_run_id"),
+            "feature_count": mi.get("feature_count", len(self._feature_cols)),
+            "metrics": mi.get("metrics", {}),
+        }
+
+        explanation = (
+            f"User has {len(history)} tracked interactions "
+            f"and {len(future_events)} future events "
+            f"({len(future_purchase_ids)} real purchases, "
+            f"{future_interaction_hits_at_k} any interactions in top-{k}). "
+            f"Model is {'cold-start popular-fallback' if is_cold else 'PRD LightGBM ranker'}. "
+            f"{bought_from_recs_count} of top-{k} recommendations were later purchased."
+        )
+
+        return {
+            "user_id": user_id,
+            "model": model_section,
+            "profile": {
+                "is_cold": is_cold,
+                "history_count": len(history),
+                "future_event_count": len(future_events),
+                "future_purchase_count": len(future_purchase_ids),
+                "top_categories": top_categories,
+            },
+            "history": history,
+            "display_k": k,
+            "analysis_k": _score_k,
+            "recommendations": recs,          # top-k display set (cards)
+            "recommendations_analysis": recs_all,  # full analysis pool
+            "future": {
+                "later_interactions_from_recommendations": later_int_from_recs,
+                "bought_from_recommendations": bought_from_recs,
+                "bought_not_recommended": bought_not_rec,
+            },
+            # "validation" is the authoritative val-period GT block.
+            # Streamlit sidebar and story must read from here — not from "metrics".
+            "validation": {
+                "positive_count": vm["positive_count"],
+                "label_hit_item_ids": vm["label_hit_item_ids"],
+                "label_hits_at_k": vm["label_hits_at_k"],
+                "label_recall_at_k": vm["label_recall_at_k"],
+            },
+            # "metrics" holds test-period event counts only.
+            "metrics": {
+                "bought_from_recs_count": bought_from_recs_count,
+                "purchase_recall_at_k": round(purchase_recall_at_k, 4),
+                "future_interaction_hits_at_k": future_interaction_hits_at_k,
+                "future_interaction_rate_at_k": round(future_interaction_rate_at_k, 4),
+                "strongest_recommended_action": _best_overall,
+            },
+            "summary": summary,
+            "after_recommendation": {
+                "recommended_with_later_actions": recommended_with_later,
+                "recommended_bought":      bought_from_recs,
+                "not_recommended_bought":  bought_not_rec,
+            },
+            "analysis": analysis_block,
+            "split_info": self._split_info,
+            "charts": {
+                "source_distribution": self._source_distribution(recs_all),
+                "history_category_distribution": self._category_distribution(history),
+                "recommendation_category_distribution": self._category_distribution(recs_all),
+                "cumulative_hits_by_rank": self._cumulative_hits_by_rank(recs),
+            },
+            "explanation": explanation,
+        }
+
+    def _source_distribution(self, recommendations: list[dict]) -> list[dict]:
+        counter: Counter = Counter()
+        for r in recommendations:
+            for src in r.get("sources", []):
+                counter[src] += 1
+        return [{"source": s, "count": c} for s, c in counter.most_common()]
+
+    def _category_distribution(
+        self, items: list[dict], field: str = "category_name"
+    ) -> list[dict]:
+        cats = [item.get(field) for item in items if item.get(field)]
+        counter: Counter = Counter(cats)
+        return [{"category": c, "count": n} for c, n in counter.most_common()]
+
+    def _cumulative_hits_by_rank(self, recommendations: list[dict]) -> list[dict]:
+        """Counts val-period GT hits (val_gt_hit) cumulatively by rank."""
+        cumulative = 0
+        result = []
+        for r in recommendations:
+            if r.get("val_gt_hit", False):
+                cumulative += 1
+            result.append({"rank": r["rank"], "cumulative_hits": cumulative})
+        return result
+
+    def _enrich_item_ids(self, item_ids: list[int]) -> list[dict]:
+        result = []
+        for iid in item_ids:
+            meta = self._item_meta_idx.loc[iid] if iid in self._item_meta_idx.index else None
+            result.append({
+                "item_id": iid,
+                "title": _safe_str(meta, "title") if meta is not None else None,
+                "brand": _safe_str(meta, "brand") if meta is not None else None,
+                "category_name": _safe_str(meta, "category_name") if meta is not None else None,
+            })
+        return result
 
     def get_model_info(self) -> dict:
         info = dict(self._model_info)
@@ -470,7 +913,12 @@ class RankerStore:
                 "category_name": None,
                 "category_path": None,
                 "sources": ["top_popular"],
+                "label": 0,
+                "val_gt_hit": False,
+                "label_hit": False,
                 "future_hit": False,
+                "future_interaction_hit": False,
+                "bought_after": False,
                 "is_repeat": False,
             }
             for i, (_, row) in enumerate(top.iterrows())

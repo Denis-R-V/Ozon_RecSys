@@ -32,6 +32,7 @@ from config import (
 from db import RequestHistory, SessionLocal, init_db
 from ranker_store import RankerStore
 from schemas import (
+    DemoStoryResponse,
     DemoUserResponse,
     DemoUserSummary,
     ModelInfoResponse,
@@ -369,6 +370,27 @@ def demo_user(
 
 
 # ---------------------------------------------------------------------------
+# /demo/story/{user_id}  — aggregated view-model for Streamlit UI
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/demo/story/{user_id}",
+    response_model=DemoStoryResponse,
+    tags=["demo"],
+)
+def demo_story(
+    user_id: int,
+    k: int = Query(20, ge=1, le=100),
+    history_limit: int = Query(20, ge=1, le=200),
+    analysis_k: int = Query(100, ge=1, le=500),
+    ranker: RankerStore = Depends(get_ranker),
+):
+    return ranker.get_demo_story(
+        user_id=user_id, k=k, history_limit=history_limit, analysis_k=analysis_k
+    )
+
+
+# ---------------------------------------------------------------------------
 # /model/info
 # ---------------------------------------------------------------------------
 
@@ -435,6 +457,36 @@ def history(
         }
         for r in rows
     ]
+
+
+@app.post("/admin/rebuild-demo-store", tags=["admin"])
+def rebuild_demo_store(
+    use_test: bool = Query(True, description="Pass --use-test flag (test_eval candidates)"),
+):
+    """Start background rebuild of api/demo_store artifacts. Restart uvicorn after completion."""
+    import pathlib
+    import subprocess
+    import sys
+
+    script = str(pathlib.Path(__file__).parent / "scripts" / "build_api_demo_store.py")
+    args = [sys.executable, script]
+    if use_test:
+        args.append("--use-test")
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(pathlib.Path(__file__).parent),
+        )
+        return {
+            "status": "started",
+            "pid": proc.pid,
+            "command": " ".join(args),
+            "note": "Check server logs for progress. Restart uvicorn to load new data.",
+        }
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to start rebuild: {exc}") from None
 
 
 @app.delete("/history", dependencies=[Depends(require_admin)], tags=["admin"])

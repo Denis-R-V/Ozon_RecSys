@@ -49,6 +49,15 @@ VAL_EVAL_DIR = (
     / "final_reranker_v12_repeat__merged_with_dl_all_repeat_history"
     / "dataset/val_eval"
 )
+TEST_EVAL_DIR = (
+    PROJECT_ROOT
+    / "data/processed/reranker"
+    / "final_reranker_v12_repeat__merged_with_dl_all_repeat_history"
+    / "dataset/test"
+)
+TEST_ORDERS_DIR = (
+    PROJECT_ROOT / "data/raw/archive_extra_orders_data/final_apparel_orders_data_07"
+)
 FEATURE_COLS_PATH = (
     PROJECT_ROOT
     / "models/reranker"
@@ -101,6 +110,29 @@ EXTRA_CANDIDATE_COLS = ["catalogid", "cat_l0", "candidate_rank", "rank"]
 
 def _log(msg: str) -> None:
     print(f"  {msg}", flush=True)
+
+
+def _quick_collect_item_ids(
+    user_ids: set[int],
+    tracker_dir: pathlib.Path,
+    max_files: int | None = None,
+) -> set[int]:
+    """Fast scan of tracker dir — reads only user_id + item_id columns."""
+    if not tracker_dir.exists():
+        return set()
+    files = sorted(tracker_dir.rglob("*.parquet"))
+    if max_files is not None:
+        files = files[:max_files]
+    ids: set[int] = set()
+    for f in files:
+        try:
+            chunk = pd.read_parquet(f, columns=["user_id", "item_id"])
+            ids.update(
+                chunk[chunk["user_id"].isin(user_ids)]["item_id"].astype(int).tolist()
+            )
+        except Exception:
+            pass
+    return ids
 
 
 def _header(msg: str) -> None:
@@ -176,12 +208,16 @@ def load_feature_cols() -> list[str]:
 # Step 2: Select demo users from val_eval
 # ---------------------------------------------------------------------------
 
-def select_demo_users(n_demo_users: int, feature_cols: list[str]) -> pd.DataFrame:
-    """Scan val_eval shards until we have n_demo_users with at least 1 positive."""
-    _header(f"Step 2: Selecting {n_demo_users} demo users from val_eval")
+def select_demo_users(
+    n_demo_users: int, feature_cols: list[str], source_dir: pathlib.Path | None = None
+) -> pd.DataFrame:
+    """Scan candidate shards until we have n_demo_users with at least 1 positive."""
+    if source_dir is None:
+        source_dir = VAL_EVAL_DIR
+    _header(f"Step 2: Selecting {n_demo_users} demo users from {source_dir.name}")
 
-    if not VAL_EVAL_DIR.exists():
-        raise FileNotFoundError(f"val_eval dir not found: {VAL_EVAL_DIR}")
+    if not source_dir.exists():
+        raise FileNotFoundError(f"candidates dir not found: {source_dir}")
 
     # Columns to load from each shard
     keep_cols = (
@@ -194,7 +230,7 @@ def select_demo_users(n_demo_users: int, feature_cols: list[str]) -> pd.DataFram
     selected_users: set[int] = set()
     frames: list[pd.DataFrame] = []
 
-    shards = sorted(VAL_EVAL_DIR.iterdir())
+    shards = sorted(source_dir.iterdir())
     t0 = time.perf_counter()
 
     for shard_dir in shards:
@@ -237,7 +273,7 @@ def select_demo_users(n_demo_users: int, feature_cols: list[str]) -> pd.DataFram
             break
 
     if not frames:
-        raise RuntimeError("No demo users found . val_eval may be empty or no positives")
+        raise RuntimeError(f"No demo users found in {source_dir}. Directory may be empty or have no positives.")
 
     df = pd.concat(frames, ignore_index=True)
     _log(f"Demo users collected: {df['user_id'].nunique()}")
@@ -408,26 +444,53 @@ def build_future_events(
     output_dir: pathlib.Path,
     item_meta: pd.DataFrame,
 ) -> None:
-    _header("Step 6: Building api_future_events.parquet")
-
-    if not _check_path(TEST_TRACKER_DIR, "test_tracker_dir"):
-        _log("Skipping future events")
-        return
-
-    test_files = sorted(TEST_TRACKER_DIR.rglob("*.parquet"))
-    _log(f"Scanning {len(test_files)} test tracker files for {len(demo_user_ids)} users")
+    _header("Step 6: Building api_future_events.parquet (tracker + real orders)")
 
     parts: list[pd.DataFrame] = []
-    t0 = time.perf_counter()
-    for i, f in enumerate(test_files):
-        chunk = pd.read_parquet(
-            f, columns=["user_id", "item_id", "timestamp", "action_type"]
-        )
-        chunk = chunk[chunk["user_id"].isin(demo_user_ids)]
-        if len(chunk):
-            parts.append(chunk)
-        if (i + 1) % 500 == 0:
-            _log(f"  {i + 1}/{len(test_files)} files  {time.perf_counter() - t0:.1f}s")
+
+    # 6a — tracker behavioral events
+    if _check_path(TEST_TRACKER_DIR, "test_tracker_dir"):
+        test_files = sorted(TEST_TRACKER_DIR.rglob("*.parquet"))
+        _log(f"Scanning {len(test_files)} test tracker files for {len(demo_user_ids)} users")
+        t0 = time.perf_counter()
+        for i, f in enumerate(test_files):
+            chunk = pd.read_parquet(
+                f, columns=["user_id", "item_id", "timestamp", "action_type"]
+            )
+            chunk = chunk[chunk["user_id"].isin(demo_user_ids)]
+            if len(chunk):
+                parts.append(chunk)
+            if (i + 1) % 500 == 0:
+                _log(f"  {i + 1}/{len(test_files)} files  {time.perf_counter() - t0:.1f}s")
+        _log(f"Tracker events collected: {sum(len(p) for p in parts):,}")
+    else:
+        _log("Skipping tracker events (test_tracker_dir not found)")
+
+    # 6b — real test-period orders (delivered + processed, not canceled)
+    if _check_path(TEST_ORDERS_DIR, "test_orders_dir"):
+        order_parts: list[pd.DataFrame] = []
+        for partition_dir in sorted(TEST_ORDERS_DIR.iterdir()):
+            if not partition_dir.is_dir():
+                continue
+            for f in sorted(partition_dir.glob("*.parquet")):
+                chunk = pd.read_parquet(
+                    f, columns=["user_id", "item_id", "created_timestamp", "last_status"]
+                )
+                chunk = chunk[chunk["user_id"].isin(demo_user_ids)]
+                chunk = chunk[chunk["last_status"] != "canceled_orders"]
+                if len(chunk):
+                    order_parts.append(chunk)
+        if order_parts:
+            orders = pd.concat(order_parts, ignore_index=True)
+            orders = orders.rename(columns={"created_timestamp": "timestamp"})
+            orders["action_type"] = "order"
+            orders = orders[["user_id", "item_id", "timestamp", "action_type"]]
+            parts.append(orders)
+            _log(f"Real orders added: {len(orders):,} (delivered + processed, {orders['user_id'].nunique()} users)")
+        else:
+            _log("No non-canceled orders found for demo users")
+    else:
+        _log("Skipping real orders (test_orders_dir not found)")
 
     if not parts:
         _log("No future events for demo users")
@@ -453,9 +516,70 @@ def build_future_events(
         f"({len(future):,} rows, {future['user_id'].nunique()} users)"
     )
 
-    # Hit analysis vs candidates
-    future_buy = future[future["action_type"].str.lower().str.contains("order|buy|purchase|cart", na=False)]
-    _log(f"Future purchase-like events: {len(future_buy):,}")
+    future_orders = future[future["action_type"] == "order"]
+    _log(f"Real order events: {len(future_orders):,} for {future_orders['user_id'].nunique()} users")
+
+
+# ---------------------------------------------------------------------------
+# Step 6b: split_info.json
+# ---------------------------------------------------------------------------
+
+def save_split_info(
+    output_dir: pathlib.Path,
+    n_demo_users: int,
+    max_tracker_files: int,
+    use_test: bool = False,
+    history_ts_min: str | None = None,
+    history_ts_max: str | None = None,
+    future_ts_min: str | None = None,
+    future_ts_max: str | None = None,
+) -> None:
+    _header("Step 6b: Saving split_info.json")
+    if use_test:
+        info: dict = {
+            "candidates_source": "test_eval",
+            "candidates_path": str(TEST_EVAL_DIR.relative_to(PROJECT_ROOT)),
+            "history_source": "train_tracker",
+            "history_path": str(TRAIN_TRACKER_DIR.relative_to(PROJECT_ROOT)),
+            "future_events_source": "test_tracker_08 + test_orders",
+            "future_events_path": str(TEST_TRACKER_DIR.relative_to(PROJECT_ROOT)),
+            "label_definition": "test_target_window_positive",
+            "ground_truth_note": (
+                "MATCH: labels (Jul 2-15 orders) == future_events (test period). "
+                "purchase_from_recs = real orders in top-k recommendations."
+            ),
+            "n_demo_users": n_demo_users,
+            "max_tracker_files_scanned": max_tracker_files,
+        }
+    else:
+        info = {
+            "candidates_source": "val_eval",
+            "candidates_path": str(VAL_EVAL_DIR.relative_to(PROJECT_ROOT)),
+            "history_source": "train_tracker",
+            "history_path": str(TRAIN_TRACKER_DIR.relative_to(PROJECT_ROOT)),
+            "future_events_source": "test_tracker_08",
+            "future_events_path": str(TEST_TRACKER_DIR.relative_to(PROJECT_ROOT)),
+            "label_definition": "val_target_window_positive",
+            "ground_truth_note": (
+                "MISMATCH: label (val period) != future_events (test period 08). "
+                "Use label_hits_at_k for metrics consistent with /demo/users sidebar."
+            ),
+            "n_demo_users": n_demo_users,
+            "max_tracker_files_scanned": max_tracker_files,
+        }
+    if history_ts_min:
+        info["history_ts_min"] = history_ts_min
+    if history_ts_max:
+        info["history_ts_max"] = history_ts_max
+    if future_ts_min:
+        info["future_ts_min"] = future_ts_min
+    if future_ts_max:
+        info["future_ts_max"] = future_ts_max
+
+    out = output_dir / "split_info.json"
+    out.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    _log(f"Saved: {out.name}")
+    _log(f"  ground_truth_note: {info['ground_truth_note']}")
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +721,13 @@ def parse_args() -> argparse.Namespace:
         "--skip-future-events", action="store_true",
         help="Skip building future events (faster build for testing)",
     )
+    p.add_argument(
+        "--use-test", action="store_true",
+        help=(
+            "Use test_eval candidates (Jul 2-15 labels) instead of val_eval. "
+            "Produces realistic purchase_from_recs metric. Requires dataset/test/ to exist."
+        ),
+    )
     return p.parse_args()
 
 
@@ -604,11 +735,14 @@ def main() -> None:
     args = parse_args()
     t_start = time.perf_counter()
 
+    source_dir = TEST_EVAL_DIR if args.use_test else VAL_EVAL_DIR
+
     print("\n" + "=" * 60)
     print("  build_api_demo_store.py")
     print(f"  project root : {PROJECT_ROOT}")
     print(f"  output dir   : {args.output_dir}")
     print(f"  demo users   : {args.n_demo_users}")
+    print(f"  candidate src: {'test_eval (Jul 2-15)' if args.use_test else 'val_eval (Jun 18 - Jul 1)'}")
     print("=" * 60)
 
     # Create output dir
@@ -618,15 +752,30 @@ def main() -> None:
     feature_cols = load_feature_cols()
 
     # Step 2
-    candidates_df = select_demo_users(args.n_demo_users, feature_cols)
+    candidates_df = select_demo_users(args.n_demo_users, feature_cols, source_dir=source_dir)
     demo_user_ids: set[int] = set(candidates_df["user_id"].unique().tolist())
 
     # Step 3
     save_candidates(candidates_df, args.output_dir, feature_cols)
 
-    # Step 4
-    item_ids = set(candidates_df["item_id"].unique().tolist())
-    item_meta = build_item_metadata(item_ids, args.output_dir)
+    # Step 4: build metadata for union of candidate + history + future item_ids
+    # Quick pre-scan tracker dirs to collect all item_ids (reads only user_id + item_id cols)
+    candidate_item_ids = set(candidates_df["item_id"].unique().tolist())
+    extra_item_ids: set[int] = set()
+    if not args.skip_history:
+        _log("Pre-scanning train tracker for item_ids (fast pass)...")
+        extra_item_ids |= _quick_collect_item_ids(
+            demo_user_ids, TRAIN_TRACKER_DIR, args.max_tracker_files
+        )
+        _log(f"  History item_ids: {len(extra_item_ids):,}")
+    if not args.skip_future_events:
+        _log("Pre-scanning test tracker for item_ids (fast pass)...")
+        fut_extra = _quick_collect_item_ids(demo_user_ids, TEST_TRACKER_DIR)
+        _log(f"  Future item_ids: {len(fut_extra):,}")
+        extra_item_ids |= fut_extra
+    all_item_ids = candidate_item_ids | extra_item_ids
+    _log(f"Total item_ids for metadata: {len(all_item_ids):,} ({len(candidate_item_ids):,} candidates + {len(extra_item_ids):,} from tracker)")
+    item_meta = build_item_metadata(all_item_ids, args.output_dir)
 
     # Step 5
     if not args.skip_history:
@@ -639,6 +788,36 @@ def main() -> None:
         build_future_events(demo_user_ids, args.output_dir, item_meta)
     else:
         _log("Skipping future events (--skip-future-events)")
+
+    # Step 6b: split_info
+    # Read timestamps from built artifacts for split_info
+    hist_ts_min = hist_ts_max = fut_ts_min = fut_ts_max = None
+    try:
+        hist_path = args.output_dir / "api_user_history.parquet"
+        if hist_path.exists():
+            h_ts = pd.read_parquet(hist_path, columns=["timestamp"])["timestamp"]
+            hist_ts_min = str(h_ts.min())
+            hist_ts_max = str(h_ts.max())
+    except Exception:
+        pass
+    try:
+        fut_path = args.output_dir / "api_future_events.parquet"
+        if fut_path.exists():
+            f_ts = pd.read_parquet(fut_path, columns=["timestamp"])["timestamp"]
+            fut_ts_min = str(f_ts.min())
+            fut_ts_max = str(f_ts.max())
+    except Exception:
+        pass
+    save_split_info(
+        args.output_dir,
+        n_demo_users=args.n_demo_users,
+        max_tracker_files=args.max_tracker_files,
+        use_test=args.use_test,
+        history_ts_min=hist_ts_min,
+        history_ts_max=hist_ts_max,
+        future_ts_min=fut_ts_min,
+        future_ts_max=fut_ts_max,
+    )
 
     # Step 7
     build_model_info(feature_cols, args.output_dir)
