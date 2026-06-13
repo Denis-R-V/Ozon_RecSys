@@ -114,6 +114,23 @@ async def lifespan(application: FastAPI):
         log.error("RankerStore load FAILED: %s", exc)
         application.state.ranker = None
 
+    # Warm up demo users cache in a background thread — app starts immediately,
+    # cache is ready within ~20 s; first /demo/users call before that falls back to live.
+    application.state.demo_users_cache = []
+
+    def _warm_demo_cache() -> None:
+        if application.state.ranker is None:
+            return
+        try:
+            rows = application.state.ranker.get_demo_users(limit=500, min_hits=0)
+            application.state.demo_users_cache = rows
+            log.info("Demo users cache warmed: %d users", len(rows))
+        except Exception as exc:
+            log.warning("Demo users cache warm FAILED: %s", exc)
+
+    import threading
+    threading.Thread(target=_warm_demo_cache, daemon=True).start()
+
     # Optionally load legacy ALS fallback
     if ENABLE_LEGACY_ALS_FALLBACK:
         _try_load_als()
@@ -122,6 +139,7 @@ async def lifespan(application: FastAPI):
 
     # Cleanup (nothing persistent to close)
     application.state.ranker = None
+    application.state.demo_users_cache = []  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -343,11 +361,22 @@ def recommendations(
 
 @app.get("/demo/users", response_model=list[DemoUserSummary], tags=["demo"])
 def demo_users(
-    limit: int = Query(20, ge=1, le=100),
-    min_hits: int | None = Query(1, ge=0),
-    ranker: RankerStore = Depends(get_ranker),
+    limit: int = Query(20, ge=1, le=500),
+    min_hits: int | None = Query(0, ge=0),
 ):
-    return ranker.get_demo_users(limit=limit, min_hits=min_hits)
+    cached: list[dict] = getattr(app.state, "demo_users_cache", [])
+    if not cached:
+        # Fallback: batch scoring (fast — ONE DuckDB query + ONE LightGBM predict).
+        # With the new batch implementation this takes ~2 s, not 30+ s.
+        ranker: RankerStore = getattr(app.state, "ranker", None)
+        if ranker is None:
+            raise HTTPException(status_code=503, detail="Ranker not loaded")
+        cached = ranker.get_demo_users(limit=500, min_hits=0)
+        app.state.demo_users_cache = cached  # populate cache for subsequent requests
+    result = cached
+    if min_hits:
+        result = [u for u in result if u.get("future_hits_at_20", 0) >= min_hits]
+    return result[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +410,7 @@ def demo_user(
 def demo_story(
     user_id: int,
     k: int = Query(20, ge=1, le=100),
-    history_limit: int = Query(20, ge=1, le=200),
+    history_limit: int = Query(20, ge=1, le=500),
     analysis_k: int = Query(100, ge=1, le=500),
     ranker: RankerStore = Depends(get_ranker),
 ):

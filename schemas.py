@@ -24,6 +24,8 @@ class RecommendationItem(BaseModel):
     strongest_later_action: str | None = None     # strongest action in test period
     strongest_later_action_ts: str | None = None  # timestamp of strongest later action
     is_repeat: bool = False
+    history_event_count: int = 0                  # total pre-cutoff history events for this item
+    history_action_counts: dict[str, int] = Field(default_factory=dict)  # action_type -> count
 
 
 class RichRecommendationResponse(BaseModel):
@@ -40,9 +42,11 @@ class DemoUserSummary(BaseModel):
     future_event_count: int
     purchase_count: int = 0           # real purchases (order/buy) in test period
     purchase_from_recs_20: int = 0    # real purchases in top-20 recommendations
+    purchase_from_recs_100: int = 0   # real purchases in top-100 recommendations
     history_count: int
-    # label-based (candidates with label=1)
+    # label-based (candidates with label=1) — val-period GT, matches /demo/users sidebar
     label_hits_at_20: int
+    label_hits_at_100: int = 0
     label_recall_at_20: float   # label_hits_at_20 / positive_count
     # future-events-based
     future_hits_at_20: int
@@ -116,6 +120,10 @@ class BoughtNotRecommended(BaseModel):
     category_name: str | None = None
     action_type: str | None = None
     timestamp: str | None = None
+    category_was_in_topk: bool = False
+    brand_was_in_topk: bool = False
+    category_was_in_history: bool = False
+    brand_was_in_history: bool = False
 
 
 class DemoStoryFuture(BaseModel):

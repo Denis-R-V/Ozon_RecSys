@@ -43,9 +43,9 @@ _SOURCE_FLAG_LABELS: dict[str, str] = {
 }
 
 _PURCHASE_ACTION_TYPES = frozenset({"order", "purchase", "buy"})
-_NEGATIVE_ACTION_TYPES = frozenset({"unfavorite", "remove"})  # not positive signals
+_NEGATIVE_ACTION_TYPES = frozenset({"unfavorite", "remove"})
 
-# Higher = stronger user intent signal
+# Higher = stronger user intent signal (used for future-event annotation)
 _ACTION_STRENGTH: dict[str, int] = {
     "order":            7,
     "purchase":         7,
@@ -56,6 +56,23 @@ _ACTION_STRENGTH: dict[str, int] = {
     "view_description": 2,
     "page_view":        1,
     "remove":           0,
+}
+
+# Priority for selecting strongest_history_action from pre-cutoff history.
+# Negative signals (unfavorite/remove) get low but non-zero priority so they
+# still appear as strongest_history_action when no positive action exists.
+# The UI suppresses unfavorite/remove from display — but is_repeat stays True.
+_HISTORY_ACTION_PRIORITY: dict[str, int] = {
+    "order":            100,
+    "purchase":         100,
+    "buy":              100,
+    "to_cart":           80,
+    "favorite":          70,
+    "review_view":       60,
+    "view_description":  50,
+    "page_view":         40,
+    "unfavorite":        10,
+    "remove":            10,
 }
 
 
@@ -279,6 +296,11 @@ class RankerStore:
                 ]
                 purchase_item_ids = frozenset(_pur["item_id"].astype(int).tolist())
 
+        # Single source of truth for all history fields: event count, action counts,
+        # strongest action, and is_repeat.  Never derives is_repeat from candidate
+        # source flags (repeat_history / is_repeat_history_candidate).
+        _history_by_item = self._build_history_by_item(user_id)
+
         # Build response
         recs: list[dict] = []
         for rank, (_, row) in enumerate(user_df.iterrows(), 1):
@@ -302,6 +324,8 @@ class RankerStore:
                     label_value = 0
             val_gt_hit = label_value > 0
 
+            _item_hist       = _history_by_item.get(iid, {})
+            _hist_evt_count  = _item_hist.get("history_event_count", 0)
             recs.append({
                 "rank": rank,
                 "item_id": iid,
@@ -314,11 +338,15 @@ class RankerStore:
                 "sources": sources,
                 "label": label_value,
                 "val_gt_hit": val_gt_hit,
-                "label_hit": val_gt_hit,                           # backward alias
-                "future_hit": iid in future_item_ids,              # legacy alias
+                "label_hit": val_gt_hit,
+                "future_hit": iid in future_item_ids,
                 "future_interaction_hit": iid in future_item_ids,
                 "bought_after": iid in purchase_item_ids,
-                "is_repeat": bool(row.get("is_repeat_history_candidate", False)),
+                # History fields — single source of truth from _build_history_by_item.
+                "is_repeat":               _hist_evt_count > 0,
+                "history_event_count":     _hist_evt_count,
+                "history_action_counts":   _item_hist.get("history_action_counts", {}),
+                "strongest_history_action": _item_hist.get("strongest_history_action"),
             })
 
         return False, recs
@@ -369,67 +397,130 @@ class RankerStore:
     def get_demo_users(
         self, limit: int = 20, min_hits: int | None = 1
     ) -> list[dict]:
-        """Return demo users sorted by label_recall_at_20 desc."""
-        con = self._duckdb_conn()
+        """Return demo users sorted by test-period purchases.
+
+        Batch approach: ONE DuckDB query + ONE LightGBM predict for all users
+        (~2 s for 500 users vs. 30+ s with the old per-user loop).
+        """
+        # ── 1. Load only needed columns (parquet projection = 14x faster) ────
         try:
-            users_df = con.execute(
-                "SELECT DISTINCT user_id FROM read_parquet(?)",
-                [str(self._candidates_path)],
-            ).df()
-        finally:
-            con.close()
+            import pyarrow.parquet as pq
+            _pq_cols = set(pq.read_schema(str(self._candidates_path)).names)
+        except Exception:
+            _pq_cols = None  # fall back to loading all cols
 
-        user_ids = users_df["user_id"].astype(int).tolist()
+        _base = ["user_id", "item_id"]
+        if _pq_cols is not None:
+            _label = ["label"] if "label" in _pq_cols else []
+            _feats = [c for c in self._feature_cols if c in _pq_cols]
+            all_cands = pd.read_parquet(
+                self._candidates_path, columns=_base + _label + _feats
+            )
+        else:
+            # Fallback: full read via DuckDB (also correct, just slower)
+            con = self._duckdb_conn()
+            try:
+                all_cands = con.execute(
+                    "SELECT * FROM read_parquet(?)", [str(self._candidates_path)]
+                ).df()
+            finally:
+                con.close()
 
+        if all_cands.empty:
+            return []
+
+        # ── 2. Score ALL candidates in ONE LightGBM call ──────────────────
+        missing = [c for c in self._feature_cols if c not in all_cands.columns]
+        if missing:
+            log.warning("get_demo_users: %d feature cols missing, zeroing", len(missing))
+            for c in missing:
+                all_cands[c] = 0.0
+
+        X = all_cands[self._feature_cols].fillna(0)  # keep DataFrame — model needs feature names
+        all_cands = all_cands.copy()
+        all_cands["_score"] = self._model.predict(X)
+
+        # ── 3. Pre-aggregate future events per user (vectorised) ──────────
+        if not self._future_events.empty and "user_id" in self._future_events.columns:
+            fut_all = (
+                self._future_events.groupby("user_id")["item_id"]
+                .apply(frozenset)
+                .to_dict()
+            )
+            if "action_type" in self._future_events.columns:
+                pur_df = self._future_events[
+                    self._future_events["action_type"].str.lower().isin(_PURCHASE_ACTION_TYPES)
+                ]
+                pur_all    = pur_df.groupby("user_id")["item_id"].apply(frozenset).to_dict()
+                pur_counts = pur_df.groupby("user_id").size().to_dict()
+            else:
+                pur_all = {}
+                pur_counts = {}
+            fut_counts = self._future_events.groupby("user_id").size().to_dict()
+        else:
+            fut_all = {}
+            pur_all = {}
+            fut_counts = {}
+            pur_counts = {}
+
+        # ── 4. Pre-aggregate history counts ───────────────────────────────
+        if not self._user_history.empty and "user_id" in self._user_history.columns:
+            hist_counts = self._user_history.groupby("user_id").size().to_dict()
+        else:
+            hist_counts = {}
+
+        # ── 5. Per-user metrics via pandas groupby (no DuckDB per user) ───
         rows: list[dict] = []
-        for uid in user_ids:
-            _, recs = self.score_user(uid, k=20)
+        for uid, user_df in all_cands.groupby("user_id"):
+            uid = int(uid)
+            user_df = user_df.sort_values("_score", ascending=False).reset_index(drop=True)
 
-            # Single shared helper — guarantees identical logic to /demo/story
-            vm = self.get_validation_metrics_for_user(uid, recs)
-            label_hits_20 = vm["label_hits_at_k"]
-            label_recall_20 = vm["label_recall_at_k"]
-            pos_count = vm["positive_count"]
-            cand_count = vm["candidate_count"]
+            top100_items = frozenset(user_df.head(100)["item_id"].astype(int))
+            top20_items  = frozenset(user_df.head(20)["item_id"].astype(int))
 
-            # Future-events-based metrics (hit = item appeared in any future event)
-            future_hits_20 = sum(1 for r in recs if r["future_hit"])
-            future_hit_rate_20 = future_hits_20 / max(len(recs), 1)
-            purchase_from_recs_20 = sum(1 for r in recs if r.get("bought_after", False))
+            fut_u = fut_all.get(uid, frozenset())
+            pur_u = pur_all.get(uid, frozenset())
 
-            # History / future event counts + purchase count
-            hist_count = 0
-            if not self._user_history.empty:
-                hist_count = int((self._user_history["user_id"] == uid).sum())
-            fut_count = 0
-            purchase_count = 0
-            if not self._future_events.empty:
-                _fut_u = self._future_events[self._future_events["user_id"] == uid]
-                fut_count = len(_fut_u)
-                if not _fut_u.empty and "action_type" in _fut_u.columns:
-                    purchase_count = int(
-                        _fut_u["action_type"].str.lower().isin(_PURCHASE_ACTION_TYPES).sum()
-                    )
+            if "label" in user_df.columns:
+                label_items = frozenset(
+                    user_df.loc[user_df["label"] > 0, "item_id"].astype(int)
+                )
+            else:
+                label_items = frozenset()
+            pos_count = len(label_items)
 
-            # Filter: min_hits applies to label_hits_at_20
-            if min_hits is not None and label_hits_20 < min_hits:
+            purchase_from_recs_20  = len(top20_items  & pur_u)
+            purchase_from_recs_100 = len(top100_items & pur_u)
+            future_hits_20         = len(top20_items  & fut_u)
+            label_hits_20  = len(top20_items  & label_items)
+            label_hits_100 = len(top100_items & label_items)
+
+            if min_hits is not None and future_hits_20 < min_hits:
                 continue
 
             rows.append({
-                "user_id": uid,
-                "candidate_count": cand_count,
-                "positive_count": pos_count,
-                "future_event_count": fut_count,
-                "purchase_count": purchase_count,
-                "purchase_from_recs_20": purchase_from_recs_20,
-                "history_count": hist_count,
-                "label_hits_at_20": label_hits_20,
-                "label_recall_at_20": round(label_recall_20, 4),
-                "future_hits_at_20": future_hits_20,
-                "future_hit_rate_at_20": round(future_hit_rate_20, 4),
+                "user_id":               uid,
+                "candidate_count":       len(user_df),
+                "positive_count":        pos_count,
+                "future_event_count":    fut_counts.get(uid, 0),
+                "purchase_count":        pur_counts.get(uid, 0),
+                "purchase_from_recs_20":  purchase_from_recs_20,
+                "purchase_from_recs_100": purchase_from_recs_100,
+                "history_count":         hist_counts.get(uid, 0),
+                "label_hits_at_20":      label_hits_20,
+                "label_hits_at_100":     label_hits_100,
+                "label_recall_at_20":    round(label_hits_20 / max(pos_count, 1), 4),
+                "future_hits_at_20":     future_hits_20,
+                "future_hit_rate_at_20": round(future_hits_20 / max(20, 1), 4),
             })
 
-        rows.sort(key=lambda x: (x["purchase_from_recs_20"], x["purchase_count"]), reverse=True)
+        rows.sort(
+            key=lambda x: (
+                x["purchase_from_recs_20"], x["purchase_from_recs_100"],
+                x["future_hits_at_20"],     x["purchase_count"]
+            ),
+            reverse=True,
+        )
         return rows[:limit]
 
     def get_demo_user_full(self, user_id: int, k: int = 20, history_limit: int = 20) -> dict:
@@ -565,22 +656,25 @@ class RankerStore:
         _hist_full = self.get_user_history(user_id, limit=5000)
         future_events = self.get_future_events(user_id)
 
-        # Build history-by-item using FULL history so all recommended items get correct badges
-        hist_by_item: dict[int, list[dict]] = {}
-        for _hh in _hist_full:
-            hist_by_item.setdefault(_hh["item_id"], []).append(_hh)
-
-        # Annotate every candidate with strongest history action (pre-test signal)
+        # Single source of truth: history fields for all recommended items.
+        # Reads self._user_history (pre-cutoff only); never touches future_events.
+        _history_by_item = self._build_history_by_item(user_id)
         for _r in recs_all:
-            _h_evts = hist_by_item.get(_r["item_id"], [])
-            if _h_evts:
-                _hb = max(
-                    _h_evts,
-                    key=lambda e: _ACTION_STRENGTH.get((e.get("action_type") or "").lower(), 0),
+            _item_hist  = _history_by_item.get(_r["item_id"], {})
+            _evt_count  = _item_hist.get("history_event_count", 0)
+            _r["history_event_count"]     = _evt_count
+            _r["history_action_counts"]   = _item_hist.get("history_action_counts", {})
+            _r["strongest_history_action"] = _item_hist.get("strongest_history_action")
+            _r["is_repeat"]               = _evt_count > 0
+
+        # Invariant: strongest_history_action must not exist without history events
+        for _r in recs_all:
+            if _r.get("strongest_history_action") and _r.get("history_event_count", 0) == 0:
+                log.warning(
+                    "BAD_HISTORY_INVARIANT user=%s item=%s sha=%s sources=%s",
+                    user_id, _r["item_id"],
+                    _r["strongest_history_action"], _r.get("sources"),
                 )
-                _r["strongest_history_action"] = _hb.get("action_type")
-            else:
-                _r["strongest_history_action"] = None
 
         # Display set (top-k cards); analysis set (top-analysis_k) keeps full recs_all
         recs = recs_all[:k]
@@ -656,12 +750,16 @@ class RankerStore:
                 "timestamp": e.get("timestamp"),
             })
 
-        # Enrich not-recommended purchases with context flags (vs full analysis pool)
-        rec_categories = {r.get("category_name") for r in recs_all if r.get("category_name")}
-        rec_brands      = {r.get("brand") for r in recs_all if r.get("brand")}
+        # Enrich not-recommended purchases with context flags (top-k display pool + full history)
+        _topk_categories = {r.get("category_name") for r in recs if r.get("category_name")}
+        _topk_brands     = {r.get("brand") for r in recs if r.get("brand")}
+        _hist_categories = {e.get("category_name") for e in _hist_full if e.get("category_name")}
+        _hist_brands     = {e.get("brand") for e in _hist_full if e.get("brand")}
         for _nr in bought_not_rec:
-            _nr["category_was_recommended"] = _nr.get("category_name") in rec_categories
-            _nr["brand_was_recommended"]    = _nr.get("brand") in rec_brands
+            _nr["category_was_in_topk"]    = _nr.get("category_name") in _topk_categories
+            _nr["brand_was_in_topk"]       = _nr.get("brand") in _topk_brands
+            _nr["category_was_in_history"] = _nr.get("category_name") in _hist_categories
+            _nr["brand_was_in_history"]    = _nr.get("brand") in _hist_brands
 
         bought_from_recs_count = len(bought_from_recs)
         purchase_recall_at_k = bought_from_recs_count / max(len(future_purchase_ids), 1)
@@ -898,6 +996,34 @@ class RankerStore:
     # Internal helpers                                                     #
     # ------------------------------------------------------------------ #
 
+    def _build_history_by_item(self, user_id: int) -> dict[int, dict]:
+        """
+        Single source of truth for pre-cutoff history per item.
+
+        Returns {item_id: {history_event_count, history_action_counts, strongest_history_action}}.
+        Only reads self._user_history (pre-test-period events).  Never touches future_events.
+        """
+        if self._user_history.empty or "user_id" not in self._user_history.columns:
+            return {}
+        hist_u = self._user_history[self._user_history["user_id"] == user_id]
+        result: dict[int, dict] = {}
+        for _, row in hist_u.iterrows():
+            iid   = int(row["item_id"])
+            atype = str(row.get("action_type") or "").lower()
+            if iid not in result:
+                result[iid] = {"history_event_count": 0, "history_action_counts": {}}
+            result[iid]["history_event_count"] += 1
+            if atype:
+                counts = result[iid]["history_action_counts"]
+                counts[atype] = counts.get(atype, 0) + 1
+        for info in result.values():
+            counts = info["history_action_counts"]
+            info["strongest_history_action"] = (
+                max(counts, key=lambda a: _HISTORY_ACTION_PRIORITY.get(a, 0))
+                if counts else None
+            )
+        return result
+
     def _popular_fallback(self, k: int) -> list[dict]:
         if self._popular_items.empty:
             return []
@@ -920,6 +1046,9 @@ class RankerStore:
                 "future_interaction_hit": False,
                 "bought_after": False,
                 "is_repeat": False,
+                "history_event_count": 0,
+                "history_action_counts": {},
+                "strongest_history_action": None,
             }
             for i, (_, row) in enumerate(top.iterrows())
         ]

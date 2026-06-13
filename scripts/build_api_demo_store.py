@@ -71,7 +71,11 @@ CATEGORIES_PATH = (
     / "part-00000-163f9108-23d6-4fd6-98c4-7bcb73ee27e2-c000.snappy.parquet"
 )
 TRAIN_TRACKER_DIR = PROJECT_ROOT / "data/raw/ml_ozon_recsys_train_final_apparel_tracker_data"
-TEST_TRACKER_DIR = PROJECT_ROOT / "data/raw/final_apparel_tracker_data_08_action_widget"
+TRAIN_ORDERS_DIR  = PROJECT_ROOT / "data/raw/ml_ozon_recsys_train_final_apparel_orders_data"
+TEST_TRACKER_DIR  = PROJECT_ROOT / "data/raw/final_apparel_tracker_data_08_action_widget"
+
+# Order statuses considered as real purchases (exclude canceled/returned)
+_POSITIVE_ORDER_STATUSES = {"delivered_orders", "processed_orders", "sent_orders"}
 POPULAR_ITEMS_PATH = PROJECT_ROOT / "models/popular_items.parquet"
 PRD_RUN_ID_PATH = (
     PROJECT_ROOT
@@ -409,6 +413,37 @@ def build_user_history(
 
     hist = pd.concat(parts, ignore_index=True).sort_values(["user_id", "timestamp"])
 
+    # Step 5b: add train-period purchase orders to history so "до: order" badges work
+    order_parts: list[pd.DataFrame] = []
+    if TRAIN_ORDERS_DIR.exists():
+        order_files = sorted(TRAIN_ORDERS_DIR.rglob("*.parquet"))
+        _log(f"Loading train orders from {len(order_files)} files (positive statuses only)")
+        for of in order_files:
+            try:
+                ochunk = pd.read_parquet(
+                    of,
+                    columns=["user_id", "item_id", "created_timestamp", "last_status"],
+                )
+                ochunk = ochunk[
+                    ochunk["user_id"].isin(demo_user_ids)
+                    & ochunk["last_status"].isin(_POSITIVE_ORDER_STATUSES)
+                ]
+                if len(ochunk):
+                    ochunk = ochunk.rename(columns={"created_timestamp": "timestamp"})
+                    ochunk["action_type"] = "order"
+                    order_parts.append(ochunk[["user_id", "item_id", "timestamp", "action_type"]])
+            except Exception as exc:
+                _log(f"  Warning: could not read {of.name}: {exc}")
+    else:
+        _log(f"TRAIN_ORDERS_DIR not found ({TRAIN_ORDERS_DIR}), skipping order history")
+
+    if order_parts:
+        orders_df = pd.concat(order_parts, ignore_index=True)
+        _log(f"  Found {len(orders_df):,} train order rows for {orders_df['user_id'].nunique()} demo users")
+        hist = pd.concat([hist, orders_df], ignore_index=True).sort_values(["user_id", "timestamp"])
+    else:
+        _log("No train order rows found for demo users")
+
     # Join item metadata
     if not item_meta.empty and "title" in item_meta.columns:
         hist = hist.merge(
@@ -694,8 +729,8 @@ def parse_args() -> argparse.Namespace:
         description="Build api/demo_store/ artifacts for FastAPI demo service"
     )
     p.add_argument(
-        "--n-demo-users", type=int, default=100,
-        help="Number of demo users to select (users with >=1 positive label). Default: 100",
+        "--n-demo-users", type=int, default=500,
+        help="Number of demo users to select (users with >=1 positive label). Default: 500",
     )
     p.add_argument(
         "--output-dir", type=pathlib.Path,
@@ -703,10 +738,10 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for demo store artifacts. Default: api/demo_store/",
     )
     p.add_argument(
-        "--max-tracker-files", type=int, default=50,
+        "--max-tracker-files", type=int, default=200,
         help=(
             "Max number of train-tracker parquet files to scan for user history. "
-            "Full coverage needs all 200 files (~20 GB). Default: 50"
+            "Full coverage needs all 200 files (~20 GB, ~5 min for 500 users). Default: 200"
         ),
     )
     p.add_argument(

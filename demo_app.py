@@ -56,14 +56,40 @@ _SRC_DESC: dict[str, str] = {
     "repeat_history":   "Ранее просмотренные товары",
 }
 
+_COL_RU: dict[str, str] = {
+    "rank":                    "Ранг",
+    "rank_in_recommendations": "Ранг",
+    "item_id":                 "ID",
+    "title":                   "Товар",
+    "brand":                   "Бренд",
+    "item_type":               "Тип",
+    "category_name":           "Категория",
+    "category":                "Категория",
+    "action_type":             "Действие",
+    "timestamp":               "Время",
+    "score":                   "score",
+    "seen_before":             "В истории",
+    "category_in_history":     "Кат. в истории",
+    "brand_in_history":        "Бренд в истории",
+    "sources":                 "Источники",
+    "interacted_in_test":      "Взаимодействовал (тест)",
+    "bought_in_test":          "Куплено (тест)",
+    "category_was_in_topk":    "Кат. в топ-k",
+    "brand_was_in_topk":       "Бренд в топ-k",
+    "category_was_in_history": "Кат. в истории",
+    "brand_was_in_history":    "Бренд в истории",
+}
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-_ACTION_STRENGTH_UI: dict[str, int] = {
-    "order": 7, "purchase": 7, "buy": 7,
-    "to_cart": 6, "favorite": 5,
-    "review_view": 3, "view_description": 2, "page_view": 1,
-}
+def _fmt_df(df: "pd.DataFrame") -> "pd.DataFrame":
+    df = df.rename(columns=_COL_RU)
+    if "Время" in df.columns:
+        df["Время"] = df["Время"].astype(str).str.slice(0, 19).replace("nan", "")
+    return df
+
+
 
 
 def _api_get(
@@ -99,24 +125,53 @@ def _api_post(
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _cached_story(api_url: str, uid: int, k: int, history_limit: int, analysis_k: int):
+def _cached_story(api_url: str, uid: int):
+    # Always fetch full analysis depth; k-slider and history filter are applied client-side.
+    # Fixed params mean cache is keyed only by (api_url, uid) → k/history sliders never cause misses.
     return _api_get(
         api_url,
         f"/demo/story/{uid}",
-        {"k": k, "history_limit": history_limit, "analysis_k": analysis_k},
+        {"k": 100, "history_limit": 500, "analysis_k": 100},
     )
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_users(api_url: str):
-    return _api_get(api_url, "/demo/users", {"limit": 100, "min_hits": 0})
+    return _api_get(api_url, "/demo/users", {"limit": 500, "min_hits": 0})
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_health(api_url: str):
+    return _api_get(api_url, "/health")
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_health_ready(api_url: str):
+    return _api_get(api_url, "/health/ready")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _catalog_categories() -> frozenset[str]:
+    """All unique category_names from the full item metadata (256 categories)."""
+    import pathlib
+    _path = pathlib.Path(__file__).parent / "api" / "demo_store" / "api_item_metadata.parquet"
+    if not _path.exists():
+        return frozenset()
+    _meta = pd.read_parquet(_path, columns=["category_name"])
+    return frozenset(_meta["category_name"].dropna().unique().tolist())
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_model_info(api_url: str):
+    return _api_get(api_url, "/model/info")
 
 
 def _source_badge(src: str) -> str:
     color = _SOURCE_COLORS.get(src, "#666")
     return (
         f'<span style="background:{color};color:white;padding:1px 4px;'
-        f'border-radius:3px;font-size:9px;margin-right:2px">{src}</span>'
+        f'border-radius:3px;font-size:9px;margin-right:2px;'
+        f'white-space:nowrap;display:inline-block">{src}</span>'
     )
 
 
@@ -136,10 +191,15 @@ def _render_rec_card(
     sources     = rec.get("sources", [])
     score       = rec.get("score", 0.0)
     rank        = rec.get("rank", 0)
-    repeat      = rec.get("is_repeat", False)
     pur_after   = rec.get("bought_after", False)
     later_int   = rec.get("later_interaction", False)
-    hist_action = rec.get("strongest_history_action") or ""   # pre-test
+
+    _iid = rec.get("item_id", 0)
+    # Backend is the single source of truth: history fields come from _build_history_by_item.
+    # Never derive is_repeat from sources[], repeat_history flag, or slider filtering.
+    repeat      = rec.get("history_event_count", 0) > 0
+    hist_action = rec.get("strongest_history_action") or ""
+
     test_action = rec.get("strongest_later_action") or ""     # test period
 
     # Green border for items the user later purchased
@@ -159,16 +219,26 @@ def _render_rec_card(
         bg           = "#fafafa"
         title_color  = "#111111"
 
-    # unfavorite/remove are negative/zero-strength signals — showing them as "до:" is misleading
-    _SUPPRESS_HIST = {"unfavorite", "remove"}
+    _NEGATIVE_HIST = {"unfavorite", "remove"}
 
     badges = ""
-    if show_hist_action and hist_action and hist_action not in _SUPPRESS_HIST:
+    # Rendering invariants (enforced by backend _build_history_by_item):
+    #   1. history_event_count > 0  →  show ↩ в истории
+    #   2. strongest_history_action →  show action (unless suppressed by checkbox or negative)
+    #   3. action shown             →  ↩ в истории always co-present (guaranteed: SHA implies evt_count>0)
+    #   4. repeat_history source    →  does NOT affect ↩ в истории (source provenance only)
+    if show_hist_action and hist_action and hist_action not in _NEGATIVE_HIST:
         badges += (
-            f'<span title="Strongest action before test period" '
+            f'<span title="Действие с товаром до тест-периода" '
             f'style="background:#546e7a;color:white;padding:2px 5px;'
             f'border-radius:3px;font-size:9px;margin-right:3px;cursor:help">'
-            f'до: {hist_action}</span>'
+            f'{hist_action}</span>'
+        )
+    if repeat:  # history_event_count > 0
+        badges += (
+            '<span title="Товар есть в истории пользователя (до тест-периода)" '
+            'style="background:#e65100;color:white;padding:2px 5px;'
+            'border-radius:3px;font-size:9px;margin-right:3px;cursor:help">↩ в истории</span>'
         )
     if show_test_action:
         if pur_after:
@@ -186,12 +256,6 @@ def _render_rec_card(
                 f'border-radius:3px;font-size:10px;margin-right:3px;cursor:help">'
                 f'→ {test_action}</span>'
             )
-    if repeat:
-        badges += (
-            '<span title="Товар из истории пользователя — ранее просмотрен/куплен" '
-            'style="background:#e65100;color:white;padding:2px 5px;'
-            'border-radius:3px;font-size:9px;cursor:help">↩ повтор</span>'
-        )
 
     if show_all_sources:
         src_html = "".join(_source_badge(s) for s in sources)
@@ -231,17 +295,17 @@ with st.sidebar:
     st.subheader("Статус сервиса")
     sc1, sc2 = st.columns(2)
     with sc1:
-        live_data, _ = _api_get(api_url, "/health")
+        live_data, _ = _cached_health(api_url)
         if live_data and live_data.get("status") == "ok":
-            st.success("Live: ok")
+            st.success("API: ok")
         else:
-            st.error("Live: fail")
+            st.error("API: fail")
     with sc2:
-        ready_data, _ = _api_get(api_url, "/health/ready")
+        ready_data, _ = _cached_health_ready(api_url)
         if ready_data and ready_data.get("status") in ("ok", "degraded"):
-            st.success("Ready: ok")
+            st.success("Модель: ok")
         else:
-            st.warning("Ready: fail")
+            st.warning("Модель: fail")
 
     st.divider()
     st.subheader("Пользователь")
@@ -258,13 +322,13 @@ with st.sidebar:
         fmt_map = {
             u["user_id"]: (
                 f"User {u['user_id']}"
-                f"  {u.get('purchase_count', 0)} покуп."
-                f"  hist={u.get('history_count', 0)}"
+                f"  ·  топ20: {u.get('purchase_from_recs_20', 0)}/{u.get('purchase_count', 0)}"
+                f"  ·  топ100: {u.get('purchase_from_recs_100', 0)}/{u.get('purchase_count', 0)}"
             )
             for u in demo_users
         }
         selected_uid = st.selectbox(
-            "Demo users",
+            "Демо-пользователи",
             options=[u["user_id"] for u in demo_users],
             format_func=lambda uid: fmt_map.get(uid, str(uid)),
         )
@@ -272,17 +336,26 @@ with st.sidebar:
         st.warning(users_err or "Demo store недоступен")
 
     st.divider()
-    k: int = st.select_slider("Карточек (топ-k)", options=[5, 10, 20, 50, 100, 200], value=20)
-    history_limit: int = st.slider(
-        "История (строк)", min_value=5, max_value=200, value=20, step=5
+    k: int = st.select_slider("Рекомендаций (топ-k)", options=[5, 10, 20, 50, 100], value=20)
+    cols_per_row: int = st.select_slider("Карточек в строке", options=[2, 3, 4, 5, 6, 8], value=4)
+
+    _TW_OPTS = ["1 нед.", "2 нед.", "3 нед.", "4 нед.", "1 мес.", "2 мес.", "3 мес."]
+    _TW_DAYS = {"1 нед.": 7, "2 нед.": 14, "3 нед.": 21, "4 нед.": 28,
+                "1 мес.": 30, "2 мес.": 60, "3 мес.": 90}
+    hist_window_label: str = st.select_slider(
+        "Горизонт истории",
+        options=_TW_OPTS,
+        value="2 мес.",
+        help="Горизонт отображения панели истории пользователя. Бейджи на карточках (↩ в истории, до: action) отражают полную pre-test историю из backend и не зависят от этого ползунка.",
     )
+    hist_badge_days: int = _TW_DAYS[hist_window_label]
     analysis_k = 100  # fixed analysis pool depth, not user-configurable
+    history_limit = 500  # always fetch enough; client-side time filter applied
 
     st.divider()
-    cols_per_row: int = st.select_slider("Карточек в строке", options=[2, 3, 4, 5, 6, 8], value=4)
-    show_hist_action: bool = st.checkbox("Показывать действие ДО рек. на карточке", value=True)
-    show_test_action: bool = st.checkbox("Показывать действие тест. периода на карточке", value=True)
-    show_all_sources: bool = st.checkbox("Показать все источники в карточках", value=False)
+    show_hist_action: bool = st.checkbox("Показывать действие до рекомендаций", value=True)
+    show_test_action: bool = st.checkbox("Показывать действия в тестовом периоде", value=True)
+    show_all_sources: bool = st.checkbox("Показывать источники кандидата", value=False)
     with st.expander("Легенда источников", expanded=False):
         for src, color in _SOURCE_COLORS.items():
             st.markdown(
@@ -295,6 +368,7 @@ with st.sidebar:
             )
 
     if st.button("Обновить", type="primary", use_container_width=True):
+        st.cache_data.clear()
         st.rerun()
 
 
@@ -303,18 +377,16 @@ with st.sidebar:
 story: dict | None = None
 story_err: str | None = None
 if selected_uid is not None:
-    story, story_err = _cached_story(api_url, selected_uid, k, history_limit, analysis_k)
+    story, story_err = _cached_story(api_url, selected_uid)
 
 
 # ── page header ───────────────────────────────────────────────────────────────
 
 st.title("Ozon Apparel Recommendation Demo")
-st.caption(
-    "9 ретриверов (ALS, CLIP, DSSM, SASRec…)  →  LightGBM LambdaRank реранкер  |  FastAPI + Streamlit"
-)
+st.caption(f"Данные из FastAPI-сервиса: {api_url}")
 st.divider()
 
-tabs = st.tabs(["Demo", "Analysis", "System", "Debug"])
+tabs = st.tabs(["Демо", "Анализ", "Система"])
 
 
 # =============================================================================
@@ -327,10 +399,25 @@ with tabs[0]:
     elif story is None:
         st.error(f"Ошибка загрузки: {story_err}")
     else:
-        profile  = story.get("profile", {})
-        summ     = story.get("summary", {})
-        recs     = story.get("recommendations", [])
-        history  = story.get("history", [])
+        profile      = story.get("profile", {})
+        summ         = story.get("summary", {})
+        _recs_full   = story.get("recommendations", [])   # full 100-item pool from API
+        recs         = _recs_full[:k]                      # visible cards (client-side slice)
+        _hist_full_r = story.get("history", [])            # up to 500 events loaded
+
+        # Filter history to the selected time window
+        _si_ui     = story.get("split_info", {})
+        _ts_max    = _si_ui.get("history_ts_max")
+        try:
+            if _ts_max:
+                _cutoff_dt = pd.to_datetime(_ts_max) - pd.Timedelta(days=hist_badge_days)
+                history = [e for e in _hist_full_r
+                           if pd.to_datetime(e.get("timestamp", "1970-01-01")) >= _cutoff_dt]
+            else:
+                history = _hist_full_r
+        except Exception:
+            history = _hist_full_r
+
         after    = story.get("after_recommendation", {})
 
         # Map story response fields (future/metrics) → local after/summ dicts
@@ -362,59 +449,54 @@ with tabs[0]:
         _bought_outside     = summ.get("not_recommended_bought_count", 0)
 
         # ── Header ────────────────────────────────────────────────────────────
-        st.subheader(f"User {story['user_id']}")
+        st.subheader(f"Пользователь {story['user_id']}")
         if is_cold:
-            st.warning("Cold user — no candidates, showing popular-items fallback.")
+            st.warning("Холодный пользователь — нет кандидатов, показывается популярное.")
 
-        st.info(
-            "**Демо тест-периода.** "
-            "FastAPI scoring в реальном времени — PRD LightGBM reranker.  "
-            "**Зелёный** = пользователь купил товар после рекомендации.  "
-            "**Синий** = взаимодействовал, но не купил."
-        )
-
-        # ── 5 metrics ─────────────────────────────────────────────────────────
+        # ── 5 metrics (all computed from visible top-k) ────────────────────────
         m1, m2, m3, m4, m5 = st.columns(5)
+        _total_purch = profile.get("future_purchase_count", 0)
         with m1:
             st.metric(
                 "Покупок (тест-период)",
-                profile.get("future_purchase_count", 0),
-                help="Реальные покупки пользователя в тест-периоде (order/buy)",
+                _total_purch,
+                help="Реальные покупки пользователя в тест-периоде (order/buy/purchase)",
             )
         with m2:
             st.metric(
-                f"Показано (топ-{k})",
+                "Рекомендаций",
                 len(recs),
-                help="Карточки рекомендаций на экране",
+                help=f"Карточек показано в топ-{k}",
             )
         with m3:
             st.metric(
-                "Куплено из рек.",
+                f"Куплено из топ-{k}",
                 _bought_topk,
-                help=f"Зелёные карточки в топ-{k}: реальные покупки после рекомендации",
+                help=f"Зелёные карточки в топ-{k}: реальные покупки (order/buy/purchase)",
             )
         with m4:
             st.metric(
-                "Взаимодействий",
+                f"Взаимодействий (топ-{k})",
                 _interactions_topk,
-                help=f"Синие карточки в топ-{k}: просмотр/избранное без покупки (unfavorite/remove не считается)",
+                help=f"Синие карточки в топ-{k}: просмотр/избранное без покупки (unfavorite/remove не учитывается)",
             )
         with m5:
             st.metric(
-                "Куплено вне рек.",
+                f"Вне топ-{_actual_analysis_k}",
                 _bought_outside,
-                help=f"Покупки товаров, которых НЕ было в топ-{_actual_analysis_k} рекомендациях (модель пропустила)",
+                help=f"Покупок товаров, которых НЕ было в топ-{_actual_analysis_k} (модель пропустила)",
             )
 
         st.caption(
-            f"Покупки: топ-{k}: {_bought_topk}"
-            f"  |  топ-{_actual_analysis_k}: {_bought_analysis}"
-            f"  |  вне рек. (мимо модели): {_bought_outside}"
+            f"В тестовом периоде пользователь купил {_total_purch} товар(ов). "
+            f"Видимый топ-{k} покрывает {_bought_topk} из {_total_purch}, "
+            f"расширенный топ-{_actual_analysis_k} покрывает {_bought_analysis} из {_total_purch}. "
+            f"Вне топ-{_actual_analysis_k} осталось {_bought_outside} покупок."
         )
         st.divider()
 
         # ── User history ──────────────────────────────────────────────────────
-        st.subheader("User history")
+        st.subheader("История пользователя")
         if history:
             # Category chips
             if top_cats:
@@ -430,16 +512,16 @@ with tabs[0]:
             _analysis = story.get("analysis", {})
             _top_brands = [b["brand"] for b in _analysis.get("history_top_brands", [])[:5] if b.get("brand")]
             if _top_brands:
-                st.caption("Top brands: " + "  ·  ".join(_top_brands))
+                st.caption("Топ бренды: " + "  ·  ".join(_top_brands))
 
-            # Action counts
+            # Action counts (over all loaded history, not just display slice)
             action_counts: dict[str, int] = {}
             for ev in history:
                 at = (ev.get("action_type") or "unknown").lower()
                 action_counts[at] = action_counts.get(at, 0) + 1
             if action_counts:
                 st.caption(
-                    "Actions: "
+                    "Действия: "
                     + "  ·  ".join(
                         f"{at}: {cnt}"
                         for at, cnt in sorted(action_counts.items(), key=lambda x: -x[1])
@@ -448,7 +530,7 @@ with tabs[0]:
 
             h_df = pd.DataFrame(history)
             for _col, _fallback in [
-                ("title",         "Unknown item"),
+                ("title",         "—"),
                 ("category_name", "—"),
                 ("brand",         "—"),
                 ("item_type",     ""),
@@ -462,14 +544,22 @@ with tabs[0]:
                  "category_name", "item_type", "item_id"]
                 if c in h_df.columns
             ]
-            st.dataframe(h_df[show_h], use_container_width=True, hide_index=True, height=350)
+            st.dataframe(_fmt_df(h_df[show_h]), use_container_width=True, hide_index=True, height=350)
         else:
             st.info("История не найдена")
 
         st.divider()
 
         # ── Recommendation cards ───────────────────────────────────────────────
-        st.subheader(f"Recommendations (top-{k})")
+        st.subheader(f"Рекомендации (топ-{k})")
+        st.caption(
+            "Тест-период: июль 2025. "
+            "**Зелёный** — куплен. "
+            "**Синий** — действия в тестовом периоде без покупки. "
+            "**«action»** — действие до рекомендаций. "
+            "**↩ в истории** — тренировочная история до тест-периода. "
+            "**источники кандидата** — показаны внизу каждой карточки."
+        )
 
         if recs:
             n_repeat = sum(1 for r in recs if r.get("is_repeat"))
@@ -480,19 +570,19 @@ with tabs[0]:
 
             ri1, ri2, ri3, ri4 = st.columns(4)
             with ri1:
-                st.metric("Seen before", f"{n_repeat} / {len(recs)}",
-                          help="Items already in user history")
+                st.metric("Повторные", f"{n_repeat} / {len(recs)}",
+                          help="Товары, которые уже были в истории пользователя")
             with ri2:
-                st.metric("New items", n_new)
+                st.metric("Новые товары", n_new)
             with ri3:
                 st.metric(
-                    "Category match",
-                    f"{len(hist_cats_t1 & rec_cats_t1)} / {len(hist_cats_t1) or 1}",
-                    help="History categories represented in top-k",
+                    "Категорий в топ",
+                    len(rec_cats_t1),
+                    help=f"Уникальных категорий в топ-{k}",
                 )
             with ri4:
-                st.metric("Unique sources", len(all_srcs),
-                          help="Distinct candidate generators in top-k")
+                st.metric("Источников", len(all_srcs),
+                          help=f"Уникальных кандидатных генераторов в топ-{k}")
 
             for row_start in range(0, len(recs), cols_per_row):
                 row_slice = recs[row_start: row_start + cols_per_row]
@@ -510,28 +600,88 @@ with tabs[0]:
 
         st.divider()
 
-        # ── What happened after ────────────────────────────────────────────────
-        st.subheader("Что купил и что посмотрел после рекомендаций")
-        st.caption(
-            f"Тест-период. Пул анализа: топ-{_actual_analysis_k} рекомендаций "
-            f"(карточки выше показывают топ-{k})."
-        )
+        # ── Debug: history invariant table ────────────────────────────────────
+        with st.expander("🔍 Debug: история по карточкам (history invariant)", expanded=False):
+            _debug_rows = []
+            for _dr in recs:
+                _debug_rows.append({
+                    "rank":                    _dr.get("rank"),
+                    "item_id":                 _dr.get("item_id"),
+                    "title":                   (_dr.get("title") or "")[:40],
+                    "is_repeat":               _dr.get("history_event_count", 0) > 0,
+                    "history_event_count":     _dr.get("history_event_count", 0),
+                    "strongest_history_action": _dr.get("strongest_history_action"),
+                    "history_action_counts":   str(_dr.get("history_action_counts") or {}),
+                    "sources":                 ", ".join(_dr.get("sources") or []),
+                })
+            if _debug_rows:
+                st.dataframe(pd.DataFrame(_debug_rows), use_container_width=True, hide_index=True)
+            # Invariant check
+            _bad = [r for r in _debug_rows if r["strongest_history_action"] and not r["is_repeat"]]
+            if _bad:
+                st.error(f"BAD_HISTORY_INVARIANT: {len(_bad)} карточек с action но history_event_count=0")
+            else:
+                st.success("Инвариант OK: все strongest_history_action согласованы с history_event_count")
+
+        # ── What happened in the test period ──────────────────────────────────
+        st.subheader("Взаимодействия пользователя в тестовом периоде")
 
         wa_later   = after.get("recommended_with_later_actions", [])
         wa_pur     = after.get("recommended_bought", [])
         wa_outside = after.get("not_recommended_bought", [])
 
+        # Split bought_from_recs into top-k slice and extra top-100 slice
+        wa_pur_topk = [p for p in wa_pur if p.get("rank_in_recommendations", 0) <= k]
+        wa_pur_ext  = [p for p in wa_pur if p.get("rank_in_recommendations", 0) > k]
+
+        wc1, wc2, wc3 = st.columns(3)
+
+        with wc1:
+            st.markdown(f"**Куплено из показанного топ-{k}** ({len(wa_pur_topk)})")
+            if wa_pur_topk:
+                df_pur_topk = pd.DataFrame(wa_pur_topk)
+                show_pur = [
+                    c for c in
+                    ["rank_in_recommendations", "item_id", "title",
+                     "brand", "category_name", "action_type", "timestamp"]
+                    if c in df_pur_topk.columns
+                ]
+                st.dataframe(_fmt_df(df_pur_topk[show_pur]), use_container_width=True, hide_index=True)
+            else:
+                st.info(f"В топ-{k} покупок нет")
+
+        with wc2:
+            st.markdown(f"**Дополнительно в топ-{_actual_analysis_k}** ({len(wa_pur_ext)})")
+            if wa_pur_ext:
+                df_pur_ext = pd.DataFrame(wa_pur_ext)
+                show_pur_ext = [
+                    c for c in
+                    ["rank_in_recommendations", "item_id", "title",
+                     "brand", "category_name", "action_type", "timestamp"]
+                    if c in df_pur_ext.columns
+                ]
+                st.dataframe(_fmt_df(df_pur_ext[show_pur_ext]), use_container_width=True, hide_index=True)
+            else:
+                st.info(f"В топ-{_actual_analysis_k} (вне топ-{k}) покупок нет")
+
+        with wc3:
+            st.markdown(f"**Куплено вне топ-{_actual_analysis_k}** ({len(wa_outside)})")
+            if wa_outside:
+                df_out = pd.DataFrame(wa_outside)
+                show_out = [
+                    c for c in
+                    ["item_id", "title", "brand", "category_name",
+                     "action_type", "timestamp",
+                     "category_was_in_topk", "brand_was_in_topk",
+                     "category_was_in_history", "brand_was_in_history"]
+                    if c in df_out.columns
+                ]
+                st.dataframe(_fmt_df(df_out[show_out]), use_container_width=True, hide_index=True)
+            else:
+                st.info("Все покупки были из рекомендаций")
+
         if wa_later:
-            _later_act_types = [r.get("action_type") for r in wa_later if r.get("action_type")]
-            _strongest_later_int = (
-                max(_later_act_types, key=lambda a: _ACTION_STRENGTH_UI.get(a.lower(), 0))
-                if _later_act_types else None
-            )
-            _later_hdr = f"**Взаимодействовал (без покупки) ({len(wa_later)})"
-            if _strongest_later_int:
-                _later_hdr += f"  ·  max: {_strongest_later_int}"
-            _later_hdr += "**"
-            st.markdown(_later_hdr)
+            st.markdown(f"**Взаимодействовал без покупки ({len(wa_later)})**")
             df_later = pd.DataFrame(wa_later)
             show_later = [
                 c for c in
@@ -539,40 +689,9 @@ with tabs[0]:
                  "category_name", "action_type", "score"]
                 if c in df_later.columns
             ]
-            st.dataframe(df_later[show_later], use_container_width=True, hide_index=True)
+            st.dataframe(_fmt_df(df_later[show_later]), use_container_width=True, hide_index=True)
         else:
             st.info("Взаимодействий с рекомендованными товарами (без покупок) нет")
-
-        wc1, wc2 = st.columns(2)
-
-        with wc1:
-            st.markdown(f"**Caught** — куплено из рек. (топ-{_actual_analysis_k})")
-            if wa_pur:
-                df_pur = pd.DataFrame(wa_pur)
-                show_pur = [
-                    c for c in
-                    ["rank_in_recommendations", "item_id", "title",
-                     "brand", "category_name", "action_type", "timestamp", "score"]
-                    if c in df_pur.columns
-                ]
-                st.dataframe(df_pur[show_pur], use_container_width=True, hide_index=True)
-            else:
-                st.info("Покупок из рекомендаций нет")
-
-        with wc2:
-            st.markdown(f"**Missed** — куплено вне рек. (мимо топ-{_actual_analysis_k})")
-            if wa_outside:
-                df_out = pd.DataFrame(wa_outside)
-                show_out = [
-                    c for c in
-                    ["item_id", "title", "brand", "category_name",
-                     "action_type", "category_was_recommended",
-                     "brand_was_recommended", "timestamp"]
-                    if c in df_out.columns
-                ]
-                st.dataframe(df_out[show_out], use_container_width=True, hide_index=True)
-            else:
-                st.info("Все покупки были из рекомендаций")
 
 
 # =============================================================================
@@ -608,14 +727,15 @@ with tabs[1]:
         hist_cat_set_an = {item.get("category") for item in hcat if item.get("category")}
 
         # ── Section 1: Category coverage ─────────────────────────────────────
-        st.subheader("Category coverage: history vs recommendations")
+        st.subheader("Категории: история vs рекомендации")
 
         ca1, ca2 = st.columns(2)
         with ca1:
             if hcat and _PLOTLY:
-                df_hc = pd.DataFrame(hcat).head(10).sort_values("count", ascending=True)
+                df_hc = pd.DataFrame(hcat).head(15).sort_values("count", ascending=True)
                 fig = px.bar(df_hc, x="count", y="category", orientation="h",
-                             title="History categories")
+                             title="История пользователя",
+                             labels={"count": "Кол-во", "category": "Категория"})
                 fig.update_layout(height=320)
                 st.plotly_chart(fig, use_container_width=True)
             elif hcat:
@@ -623,11 +743,12 @@ with tabs[1]:
 
         with ca2:
             if rcat and _PLOTLY:
-                df_rc = pd.DataFrame(rcat).head(10).sort_values("count", ascending=True)
+                df_rc = pd.DataFrame(rcat).head(15).sort_values("count", ascending=True)
                 df_rc["in_history"] = df_rc["category"].isin(hist_cat_set_an)
                 fig = px.bar(
                     df_rc, x="count", y="category", orientation="h",
-                    title="Recommended categories (green = in history)",
+                    title=f"Рекомендованные категории (зелёный — из истории)",
+                    labels={"count": "Кол-во", "category": "Категория"},
                     color="in_history",
                     color_discrete_map={True: "#2e7d32", False: "#90a4ae"},
                 )
@@ -637,35 +758,59 @@ with tabs[1]:
                 st.dataframe(pd.DataFrame(rcat), use_container_width=True, hide_index=True)
 
         # Category overlap / miss table
-        all_cats_an = {item.get("category") for item in hcat + rcat if item.get("category")}
+        # Use ALL catalog categories as rows — fixed base regardless of user
+        _all_cat_set = _catalog_categories()
+        all_cats_an = _all_cat_set if _all_cat_set else {item.get("category") for item in hcat + rcat if item.get("category")}
         if all_cats_an:
             _hcc = {item["category"]: item["count"] for item in hcat}
             _rcc = {item["category"]: item["count"] for item in rcat}
 
-            def _cstatus(c: str) -> str:
-                return ("match" if (_hcc.get(c, 0) > 0 and _rcc.get(c, 0) > 0)
-                        else ("miss" if _hcc.get(c, 0) > 0 else ""))
+            # Purchases per category — ALL test-period purchases (from recs + outside recs).
+            _future_an = story.get("future", {})
+            _all_pur_an = (
+                _future_an.get("bought_from_recommendations", [])
+                + _future_an.get("bought_not_recommended", [])
+            )
+            _all_int_an  = _future_an.get("later_interactions_from_recommendations", [])
+            _pur_by_cat: dict[str, int] = {}
+            for _p in _all_pur_an:
+                _pc = _p.get("category_name")
+                if _pc:
+                    _pur_by_cat[_pc] = _pur_by_cat.get(_pc, 0) + 1
+            _int_by_cat: dict[str, int] = {}
+            for _i in _all_int_an:
+                _ic = _i.get("category_name")
+                if _ic:
+                    _int_by_cat[_ic] = _int_by_cat.get(_ic, 0) + 1
 
             overlap_rows = [
-                {"Category": c, "In history": _hcc.get(c, 0),
-                 "In top-k": _rcc.get(c, 0), "Status": _cstatus(c)}
+                {"Категория": c,
+                 "В истории":             _hcc.get(c, 0),
+                 "В топ-k":               _rcc.get(c, 0),
+                 "Куплено (тест)":        _pur_by_cat.get(c, 0),
+                 "Взаимодействовал (тест)": _int_by_cat.get(c, 0)}
                 for c in all_cats_an
+                if _hcc.get(c, 0) + _rcc.get(c, 0) + _pur_by_cat.get(c, 0) + _int_by_cat.get(c, 0) > 0
             ]
-            _go = {"match": 0, "miss": 1, "": 2}
-            overlap_rows.sort(key=lambda x: (_go[x["Status"]], -x["In history"]))
-            n_match = sum(1 for r in overlap_rows if r["Status"] == "match")
-            n_miss  = sum(1 for r in overlap_rows if r["Status"] == "miss")
-            st.caption(f"match: {n_match}  |  miss (in history, not in top-k): {n_miss}")
-            st.dataframe(pd.DataFrame(overlap_rows[:20]),
+            overlap_rows.sort(key=lambda x: (-x["Куплено (тест)"], -x["Взаимодействовал (тест)"], -x["В истории"]))
+            n_match = sum(1 for r in overlap_rows if r["В истории"] > 0 and r["В топ-k"] > 0)
+            n_miss  = sum(1 for r in overlap_rows if r["В истории"] > 0 and r["В топ-k"] == 0)
+            st.caption(
+                f"всего в каталоге: {len(all_cats_an)}  |  "
+                f"непустых строк: {len(overlap_rows)}  |  "
+                f"история ∩ топ-k: {n_match}  |  "
+                f"пропущено: {n_miss}"
+            )
+            st.dataframe(pd.DataFrame(overlap_rows),
                          use_container_width=True, hide_index=True)
 
         st.divider()
 
         # ── Section 2: Candidate sources ─────────────────────────────────────
-        st.subheader("Candidate sources")
+        st.subheader("Источники кандидатов")
         st.caption(
-            "Source provenance of candidates — which generator nominated each item. "
-            "Not a direct SHAP/feature importance explanation of the LightGBM ranking."
+            "Откуда пришёл каждый товар — какой генератор его выдвинул. "
+            "Это не SHAP/feature importance LightGBM-реранкера, а источник кандидата на этапе ретривала."
         )
 
         src_data = _analysis.get("source_distribution") or []
@@ -673,19 +818,41 @@ with tabs[1]:
             src_data = story.get("charts", {}).get("source_distribution", [])
 
         if src_data and _PLOTLY:
-            sc1, sc2 = st.columns(2)
+            # Top-20 source distribution computed client-side
+            _src_20: dict[str, int] = {}
+            for _r in _recs_an[:20]:
+                for _s in _r.get("sources", []):
+                    _src_20[_s] = _src_20.get(_s, 0) + 1
+            df_src_20 = (
+                pd.DataFrame([{"source": s, "count": c} for s, c in _src_20.items()])
+                .sort_values("count", ascending=True)
+            ) if _src_20 else pd.DataFrame()
+
+            sc1, sc2, sc3 = st.columns(3)
             with sc1:
-                df_src = pd.DataFrame(src_data).sort_values("count", ascending=True)
-                fig = px.bar(df_src, x="count", y="source", orientation="h",
-                             title="Sources in top-k",
-                             color="count", color_continuous_scale="Blues")
-                fig.update_layout(coloraxis_showscale=False, height=300)
-                st.plotly_chart(fig, use_container_width=True)
+                if not df_src_20.empty:
+                    fig20 = px.bar(df_src_20, x="count", y="source", orientation="h",
+                                   title="Источники в топ-20",
+                                   labels={"count": "Кол-во", "source": "Источник"},
+                                   color="count", color_continuous_scale="Greens")
+                    fig20.update_layout(coloraxis_showscale=False, height=320)
+                    st.plotly_chart(fig20, use_container_width=True)
 
             with sc2:
+                df_src = pd.DataFrame(src_data).sort_values("count", ascending=True)
+                fig = px.bar(df_src, x="count", y="source", orientation="h",
+                             title="Источники в топ-100",
+                             labels={"count": "Кол-во", "source": "Источник"},
+                             color="count", color_continuous_scale="Blues")
+                fig.update_layout(coloraxis_showscale=False, height=320)
+                st.plotly_chart(fig, use_container_width=True)
+
+            with sc3:
                 n_recs_an = len(_recs_an)
-                if n_recs_an >= 15:
-                    bands = [(1, 5), (6, 10), (11, n_recs_an)]
+                if n_recs_an >= 51:
+                    bands = [(1, 5), (6, 20), (21, 50), (51, n_recs_an)]
+                elif n_recs_an >= 21:
+                    bands = [(1, 5), (6, 20), (21, n_recs_an)]
                 elif n_recs_an >= 8:
                     _mid = n_recs_an // 2
                     bands = [(1, _mid), (_mid + 1, n_recs_an)]
@@ -706,38 +873,48 @@ with tabs[1]:
                     df_band = pd.DataFrame(band_rows)
                     fig_b = px.bar(
                         df_band, x="Rank band", y="count", color="source",
-                        title="Sources by rank position",
+                        title="Источники по позиции в выдаче",
+                        labels={"count": "Кол-во", "source": "Источник", "Rank band": "Позиция"},
                         color_discrete_map=_SOURCE_COLORS, barmode="stack",
                     )
-                    fig_b.update_layout(height=300, legend_title="Source")
+                    fig_b.update_layout(height=420, legend_title="Источник")
                     st.plotly_chart(fig_b, use_container_width=True)
-                    st.caption("Y-axis = source occurrences per rank band (one item can have multiple sources).")
+                    st.caption("Ось Y — число источников в полосе позиций (один товар может иметь несколько источников).")
         elif src_data:
             st.dataframe(pd.DataFrame(src_data), use_container_width=True, hide_index=True)
 
         st.divider()
 
         # ── Section 3: Seen-before / new split ───────────────────────────────
-        st.subheader("Seen-before vs new items")
-        n_seen = _analysis.get("seen_before_count", sum(1 for r in _recs_an if r.get("is_repeat")))
-        n_new  = _analysis.get("new_items_count",  len(_recs_an) - n_seen)
+        st.subheader("Повторные vs новые товары")
 
-        sb1, sb2, sb3 = st.columns(3)
+        _recs_an_20  = _recs_an[:20]
+        _recs_an_100 = _recs_an[:100]
+        _n20  = len(_recs_an_20)  or 1
+        _n100 = len(_recs_an_100) or 1
+
+        _seen_20  = sum(1 for r in _recs_an_20  if r.get("is_repeat"))
+        _seen_100 = sum(1 for r in _recs_an_100 if r.get("is_repeat"))
+
+        sb1, sb2, sb3, sb4 = st.columns(4)
         with sb1:
-            st.metric("Seen before", n_seen, help="Items the user previously interacted with")
+            st.metric("Повторные топ-20",  f"{_seen_20} / {len(_recs_an_20)}",
+                      help="Товаров из топ-20, которые уже были в истории (is_repeat)")
         with sb2:
-            st.metric("New items", n_new)
+            st.metric("Повторные топ-100", f"{_seen_100} / {len(_recs_an_100)}",
+                      help="Товаров из топ-100, которые уже были в истории (is_repeat)")
         with sb3:
-            pct = round(100 * n_seen / max(len(_recs_an), 1))
-            st.metric("Repeat rate", f"{pct}%")
+            st.metric("Новые топ-20",  len(_recs_an_20)  - _seen_20)
+        with sb4:
+            st.metric("Новые топ-100", len(_recs_an_100) - _seen_100)
 
         st.divider()
 
         # ── Section 4: Prediction evidence table ──────────────────────────────
-        st.subheader("Prediction evidence")
+        st.subheader("Детализация по товарам (топ-k)")
         st.caption(
-            "Per-item view: what the ranker knew at score time "
-            "and what user did after."
+            "По каждому товару из показанного топ-k: что модель знала при скоринге "
+            "и что пользователь сделал в тест-периоде."
         )
 
         if _recs_an:
@@ -748,20 +925,20 @@ with tabs[1]:
             for r in _recs_an:
                 _srcs = r.get("sources", [])
                 evidence.append({
-                    "rank":           r["rank"],
-                    "title":          (r.get("title") or "?")[:50],
-                    "brand":          r.get("brand") or "",
-                    "category":       r.get("category_name") or "",
-                    "score":          round(r["score"], 4),
-                    "seen_before":    r.get("is_repeat", False),
-                    "cat_in_hist":    r.get("category_name") in _hist_cats_ev,
-                    "brand_in_hist":  r.get("brand") in _hist_brands_ev if r.get("brand") else False,
-                    "sources":        ", ".join(_srcs[:3]) + ("…" if len(_srcs) > 3 else ""),
-                    "later_int":  r.get("later_interaction", False),
-                    "bought":     r.get("bought_after", False),
+                    "rank":                 r["rank"],
+                    "title":                (r.get("title") or "?")[:50],
+                    "brand":                r.get("brand") or "",
+                    "category":             r.get("category_name") or "",
+                    "score":                round(r["score"], 4),
+                    "seen_before":          r.get("is_repeat", False),
+                    "category_in_history":  r.get("category_name") in _hist_cats_ev,
+                    "brand_in_history":     r.get("brand") in _hist_brands_ev if r.get("brand") else False,
+                    "sources":              ", ".join(_srcs[:3]) + ("…" if len(_srcs) > 3 else ""),
+                    "interacted_in_test":   r.get("later_interaction", False),
+                    "bought_in_test":       r.get("bought_after", False),
                 })
 
-            st.dataframe(pd.DataFrame(evidence), use_container_width=True, hide_index=True)
+            st.dataframe(_fmt_df(pd.DataFrame(evidence)), use_container_width=True, hide_index=True)
 
 
 # =============================================================================
@@ -769,143 +946,135 @@ with tabs[1]:
 # =============================================================================
 
 with tabs[2]:
-    model_info, mi_err = _api_get(api_url, "/model/info")
+    model_info, mi_err = _cached_model_info(api_url)
+    status_label = (ready_data or {}).get("status", "unknown")
 
+    # ── Model identity ─────────────────────────────────────────────────────
+    st.subheader("Модель")
     if model_info:
-        st.subheader("Model and offline metrics")
+        _model_name = model_info.get("model_name") or "—"
+        _prd_run    = model_info.get("prd_run_id") or "—"
+        _feat_count = model_info.get("feature_count", "—")
+        _model_uri  = model_info.get("model_uri") or "—"
+
+        sys_c1, sys_c2, sys_c3 = st.columns([2, 2, 1])
+        with sys_c1:
+            st.markdown("**Модель**")
+            st.code(_model_name, language=None)
+        with sys_c2:
+            st.markdown("**MLflow run_id (PRD)**")
+            st.code(_prd_run, language=None)
+        with sys_c3:
+            st.metric("Признаков", _feat_count)
+            st.metric("API", status_label)
+
+        if _model_uri != "—":
+            st.caption(f"URI: `{_model_uri}`")
+
+    else:
+        st.error(f"Не удалось загрузить /model/info: {mi_err}")
+
+    st.divider()
+
+    # ── Offline metrics ────────────────────────────────────────────────────
+    st.subheader("Офлайн-метрики (тест)")
+    if model_info:
         metrics_dict: dict = model_info.get("metrics", {})
+        baseline_dict: dict = model_info.get("baseline", {})
 
-        # Test metrics only — no val fallback
-        ndcg_val = (
-            metrics_dict.get("test_ndcg_at_100")
-            or metrics_dict.get("ndcg_at_100")
-            or metrics_dict.get("reranker_ndcg_at_100")
-        )
-        recall_val = (
-            metrics_dict.get("test_recall_at_100")
-            or metrics_dict.get("recall_at_100")
-            or metrics_dict.get("reranker_recall_at_100")
-        )
-        status_label = (ready_data or {}).get("status", "unknown")
+        def _mv(d: dict, *keys) -> str:
+            for k in keys:
+                v = d.get(k)
+                if v is not None:
+                    return f"{v:.4f}"
+            return "—"
 
-        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-        with mc1:
-            st.metric("Model", model_info.get("model_name", "—"))
-        with mc2:
-            st.metric("Features", model_info.get("feature_count", "—"))
-        with mc3:
-            st.metric(
-                "NDCG@100 (test, offline)",
-                f"{ndcg_val:.4f}" if isinstance(ndcg_val, float) else "—",
-                help="Offline metric from test split (reranker_ndcg_at_100 or test_ndcg_at_100)",
-            )
-        with mc4:
-            st.metric(
-                "Recall@100 (offline)",
-                f"{recall_val:.4f}" if isinstance(recall_val, float) else "—",
-            )
-        with mc5:
-            st.metric("API status", status_label)
+        # NDCG — only columns with actual values
+        _ndcg_items = [
+            (_n, _mv(metrics_dict, f"test_ndcg_at_{_n}", f"ndcg_at_{_n}", f"reranker_ndcg_at_{_n}"),
+                  _mv(baseline_dict, f"ndcg_at_{_n}", f"baseline_ndcg_at_{_n}"))
+            for _n in [10, 20, 50, 100]
+        ]
+        _ndcg_items = [x for x in _ndcg_items if x[1] != "—"]
+        if _ndcg_items:
+            for _col, (_n, _v, _b) in zip(st.columns(len(_ndcg_items)), _ndcg_items):
+                with _col:
+                    _delta = f"{float(_v) - float(_b):+.4f} vs baseline" if _b != "—" else None
+                    st.metric(f"NDCG@{_n}", _v, delta=_delta)
+
+        st.divider()
+
+        # Recall — only columns with actual values; candidate recall appended if present
+        _recall_items = [
+            (_n, _mv(metrics_dict, f"test_recall_at_{_n}", f"recall_at_{_n}", f"reranker_recall_at_{_n}"),
+                  _mv(baseline_dict, f"recall_at_{_n}", f"baseline_recall_at_{_n}"))
+            for _n in [20, 50, 100]
+        ]
+        _recall_items = [x for x in _recall_items if x[1] != "—"]
+        _cand_v = _mv(metrics_dict, "candidate_recall_at_100", "retrieval_recall_at_100", "recall_candidates")
+        if _cand_v != "—":
+            _recall_items.append(("cand", _cand_v, "—"))
+        if _recall_items:
+            for _col, (_n, _v, _b) in zip(st.columns(len(_recall_items)), _recall_items):
+                with _col:
+                    if _n == "cand":
+                        st.metric("Candidate recall@100", _v)
+                    else:
+                        _delta = f"{float(_v) - float(_b):+.4f} vs baseline" if _b != "—" else None
+                        st.metric(f"Recall@{_n}", _v, delta=_delta)
+
+        # All remaining metrics in a collapsible table
+        _shown = {k for k in metrics_dict if any(
+            k.endswith(f"_{n}") for n in ["10", "20", "50", "100"]
+        )}
+        _extra = {k: v for k, v in metrics_dict.items() if k not in _shown}
+        if _extra:
+            with st.expander("Все метрики MLflow", expanded=False):
+                st.dataframe(
+                    pd.DataFrame([{"Метрика": k, "Значение": v} for k, v in sorted(_extra.items())]),
+                    use_container_width=True, hide_index=True,
+                )
 
         art = model_info.get("artifact_status", {})
         if art:
-            st.subheader("Artifact health")
+            st.divider()
+            st.subheader("Артефакты")
             st.dataframe(
-                pd.DataFrame([{"Artifact": k_a, "Status": v} for k_a, v in art.items()]),
-                use_container_width=True,
-                hide_index=True,
+                pd.DataFrame([{"Артефакт": k_a, "Статус": v} for k_a, v in art.items()]),
+                use_container_width=True, hide_index=True,
             )
-    else:
-        st.error(f"Failed to load /model/info: {mi_err}")
 
     st.divider()
-    st.subheader("Architecture")
-    st.markdown(
-        """
-```
-Offline store            Online scoring             Serving
-─────────────────────    ──────────────────────     ─────────────────
-Parquet / DuckDB   ──►   LightGBM LambdaRank  ──►  FastAPI  ──►  Streamlit
-(api/demo_store/)         (real-time predict)        (REST)       (this UI)
-```
 
-| Stage | Description |
-|-------|-------------|
-| **Retrieval** | 9 generators: ALS, DSSM, SASRec, BERT4Rec, CLIP+HNSW, CLIP+FAISS, I2I BM25, TopPopular, UserCatPopular, RepeatHistory |
-| **Features** | 240 numeric features (user / item / category / candidate-level) |
-| **Reranking** | LightGBM LambdaRank, optimized for NDCG@100 |
-| **Demo store** | 100 pre-scored users, pre-built artifacts ~18 MB (`api/demo_store/`) |
-| **Labeled replay** | Val-period labels used in training — see Debug tab for sanity-check |
-"""
-    )
+    # ── Pipeline ───────────────────────────────────────────────────────────
+    st.subheader("Пайплайн")
+    st.markdown("""
+**Датасет:** Ozon Apparel — одежда и аксессуары, июнь–июль 2025.
+Обучение/валидация/тест: `< Jun 18` / `Jun 18 – Jul 1` / `Jul 1 – Jul 15`.
+
+**Стадия 1 — Ретривал (10 генераторов кандидатов):**
+
+| Генератор | Тип | Описание |
+|-----------|-----|----------|
+| ALS | Коллаборативная фильтрация | Matrix factorization (implicit) |
+| DSSM | Двухбашенная сеть | User/item эмбеддинги, dot-product |
+| SASRec | Трансформер | Self-attention на последовательности действий |
+| BERT4Rec | Трансформер | BERT-style masked LM на сессиях |
+| CLIP+HNSW | Визуальный поиск | Эмбеддинги изображений, граф HNSW |
+| CLIP+FAISS | Визуальный поиск | Эмбеддинги изображений, FAISS индекс |
+| I2I BM25 | Item-to-item | BM25 по текстовым атрибутам товара |
+| TopPopular | Популярность | Глобально популярные товары |
+| UserCatPopular | Популярность | Популярные в категориях из истории пользователя |
+| RepeatHistory | Детерминированный | Товары из истории пользователя (~2 мес.) — прямой повтор |
+
+**Стадия 2 — Реранкинг:**
+- **Модель:** LightGBM LambdaRank
+- **Цель:** NDCG@100
+- **Признаки:** ~240 числовых (user / item / category / candidate-level)
+- **Группы признаков:** статистика взаимодействий пользователя (7/14/30/60d), статистика товара, категориальное сходство, флаги повторного просмотра, позиция в кандидатном пуле
+
+**Сервинг:** FastAPI → Streamlit.
+Demo store: 100 pre-scored пользователей, артефакты ~18 MB (`api/demo_store/`).
+""")
 
 
-# =============================================================================
-# Tab 4: Debug
-# =============================================================================
-
-with tabs[3]:
-    st.subheader("Raw API responses")
-
-    if story:
-        with st.expander(f"GET /demo/story/{selected_uid}?k={k}", expanded=False):
-            st.json(story)
-
-    mi_raw, _ = _api_get(api_url, "/model/info")
-    if mi_raw:
-        with st.expander("GET /model/info", expanded=False):
-            st.json(mi_raw)
-
-    hr_raw, _ = _api_get(api_url, "/health/ready")
-    if hr_raw:
-        with st.expander("GET /health/ready", expanded=False):
-            st.json(hr_raw)
-
-    st.subheader("Curl examples")
-    if selected_uid is not None:
-        st.code(
-            f"# Story endpoint\n"
-            f'curl "{api_url}/demo/story/{selected_uid}?k={k}'
-            f'&history_limit={history_limit}"\n'
-            f"\n# Rich recommendations\n"
-            f'curl "{api_url}/recommendations/{selected_uid}?k={k}"\n'
-            f"\n# Forward (compatible)\n"
-            f'curl -X POST "{api_url}/forward" \\\n'
-            f'  -H "Content-Type: application/json" \\\n'
-            f'  -d \'{{"user_id": {selected_uid}, "k": {k}}}\'\n'
-            f"\n# Demo users list\n"
-            f'curl "{api_url}/demo/users?limit=20&min_hits=0"\n'
-            f"\n# Health\n"
-            f'curl "{api_url}/health/ready"',
-            language="bash",
-        )
-    else:
-        st.info("Select a user to see curl examples")
-
-    st.divider()
-    with st.expander("Пересборка демо данных", expanded=False):
-        st.caption(
-            "Пересобирает api/demo_store/ из train/test данных (~1-2 мин). "
-            "После завершения нужен рестарт uvicorn."
-        )
-        _use_test_flag = st.checkbox("--use-test (test_eval кандидаты)", value=True)
-        if st.button("Запустить пересборку", type="secondary"):
-            _rb, _rb_err = _api_post(
-                api_url,
-                "/admin/rebuild-demo-store",
-                {"use_test": str(_use_test_flag).lower()},
-            )
-            if _rb:
-                st.success(f"Запущено (PID {_rb.get('pid')}). {_rb.get('note', '')}")
-                st.code(_rb.get("command", ""))
-            else:
-                st.error(f"Ошибка: {_rb_err}")
-
-    with st.expander("Labeled replay sanity-check (val-period labels, not primary metric)", expanded=False):
-        st.caption("Val-period labels are training data — not the demo quality metric.")
-        if story:
-            val_block = story.get("validation", {})
-            if val_block:
-                st.json(val_block)
-            else:
-                st.info("No validation block in story response")
